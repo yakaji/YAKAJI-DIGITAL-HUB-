@@ -48,9 +48,9 @@ function compileRoutePattern(pattern: string) {
 const compiledRoutes = Object.keys(handler).map(compileRoutePattern);
 
 // Serve uploaded media stored via storage.write
-app.use('/_storage', (req, res) => {
+app.use('/_storage', async (req, res) => {
   const rawKey = decodeURIComponent(req.path.replace(/^\/+/, ''));
-  const asset = getStoredMedia(rawKey);
+  const asset = await getStoredMedia(rawKey);
   if (!asset) {
     res.status(404).send('Media not found');
     return;

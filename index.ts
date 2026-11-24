@@ -8,6 +8,14 @@ import {
   verifyPassword,
   verifyPlainSecret,
 } from './server/auth-utils';
+import {
+  ensureDailyBackupFresh,
+  getRedactedBackupDownload,
+  listBackups,
+  restoreFromBackupSafe,
+  runDatabaseBackup,
+  verifyBackupIntegrity,
+} from './server/backup-service';
 
 const ADMIN_EMAILS = ['salimaminu103@gmail.com'];
 const ADMIN_OWNER_ID = 'owner-salimaminu103';
@@ -1118,35 +1126,62 @@ export const handler = router({
     const userId = 'usr-' + crypto.randomUUID().slice(0, 14);
     const now = new Date().toISOString();
     const canonicalKey = canonicalEmailKey(email);
-    const [claimedEmail] = await db.tx.add('email_accounts', [{
-      id: canonicalKey,
-      userId,
-      email,
-      createdAt: now,
-    }]);
-    if (!claimedEmail) {
-      return duplicateResponse();
-    }
-
     const passwordHash = hashPassword(password);
-    const [created] = await db.tx.add('users', [{
-      id: userId,
-      email,
-      fullName,
-      phone,
-      role: 'customer',
-      passwordHash,
-      createdAt: now,
-      updatedAt: now,
-      lastLoginAt: now,
-    }]);
-    if (!created) {
-      await db.delete('email_accounts', [canonicalKey]);
-      return fail('Could not create your account. Please try again.', 500);
+
+    try {
+      await db.transact([
+        db.tx.add('email_accounts', [{
+          id: canonicalKey,
+          userId,
+          email,
+          createdAt: now,
+        }]),
+        db.tx.add('users', [{
+          id: userId,
+          email,
+          canonicalEmail: canonicalKey,
+          fullName,
+          phone,
+          role: 'customer',
+          passwordHash,
+          accountStatus: 'active',
+          createdAt: now,
+          updatedAt: now,
+          lastLoginAt: now,
+        }]),
+        db.tx.add('profiles', [{
+          id: userId,
+          email,
+          fullName,
+          phone,
+          whatsapp,
+          address,
+          city,
+          state,
+          country: 'Nigeria',
+          createdAt: now,
+          updatedAt: now,
+          lastSeenAt: now,
+        }]),
+        db.tx.add('wallet_accounts', [{
+          id: userId,
+          balance: 0,
+          updatedAt: now,
+        }]),
+      ]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (msg.includes('email_accounts:')) {
+        return duplicateResponse();
+      }
+      console.error('Registration database transaction failed:', err);
+      return fail('Could not save your registration to the permanent database. Please try again.', 500);
     }
 
-    await ensureProfileRecord({ userId, email, fullName, phone, address, city, state, whatsapp });
-    await ensureWalletAccount(userId);
+    const [confirmedUser] = await db.get<Record<string, unknown>>('users', [userId], { consistent: true });
+    if (!confirmedUser) {
+      return fail('Registration could not be verified in the permanent database. Please try again.', 500);
+    }
 
     const cleanUser = sanitizeUserForClient({
       userId,
@@ -1556,6 +1591,68 @@ export const handler = router({
     }], { patch: true });
 
     return json({ updated: true, message: 'Owner admin password updated securely.' });
+  }],
+  'GET /api/admin/backups': [...admin, async () => {
+    await ensureDailyBackupFresh();
+    const backups = await listBackups(40);
+    return json({
+      backups,
+      policy: {
+        schedule: 'Automatic daily backup (every 24h)',
+        retentionDays: 30,
+        manualRetentionDays: 90,
+        engine: 'Cloud SQL PostgreSQL + Verified Snapshots',
+      },
+    });
+  }],
+  'POST /api/admin/backups/run': [...admin, async () => {
+    try {
+      const backup = await runDatabaseBackup('manual');
+      return json({
+        backup,
+        message: backup.verified
+          ? `Backup ${backup.id} created and verified (${backup.recordCount} records).`
+          : 'Backup created, but integrity verification flagged a mismatch.',
+      }, 201);
+    } catch (e) {
+      console.error('Manual backup failed:', e);
+      return fail('Could not complete database backup. Please try again.', 500);
+    }
+  }],
+  'POST /api/admin/backups/:id/verify': [...admin, async ({ params }) => {
+    try {
+      const backup = await verifyBackupIntegrity(params.id);
+      return json({
+        backup,
+        message: backup.verified ? 'Backup checksum verified successfully.' : 'Backup checksum verification failed.',
+      });
+    } catch (e) {
+      return fail(e instanceof Error ? e.message : 'Backup not found.', 404);
+    }
+  }],
+  'POST /api/admin/backups/:id/restore': [...admin, async ({ params }) => {
+    try {
+      const result = await restoreFromBackupSafe(params.id);
+      return json({
+        restored: true,
+        ...result,
+        message: `Safe non-destructive restore completed (${result.totalRestored} missing record(s) recovered without overwriting live records).`,
+      });
+    } catch (e) {
+      return fail(e instanceof Error ? e.message : 'Could not restore backup.', 400);
+    }
+  }],
+  'GET /api/admin/backups/:id/download': [...admin, async ({ params }) => {
+    const payload = await getRedactedBackupDownload(params.id);
+    if (!payload) return fail('Backup not found.', 404);
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${params.id.replace(/[^a-zA-Z0-9._-]/g, '_')}.json"`,
+      },
+      body: payload,
+    };
   }],
   'POST /api/subscriptions': [requireAuth(), async ({ body, user }) => {
     const b = body as { entity_type?: string; entity_id?: string; connection_id?: string };
@@ -2353,7 +2450,9 @@ export const handler = router({
       ? await db.tx.update('affiliates', [{ id: user!.userId, record, if: { registrationPaymentStatus: existing.registrationPaymentStatus } }], { patch: true })
       : await db.tx.add('affiliates', [record]);
     if (!saved) return fail('Could not save your affiliate application. Refresh and try again.', 409);
-    return json({ affiliate: record, authorizationUrl, bankTransfer: paymentMethod === 'Bank transfer' ? { bankName: 'Moniepoint MFB', accountName: 'Yakaji Digital Hub', accountNumber: '3005758913', amount: fee, reference } : null }, 201);
+    const [confirmedAffiliate] = await db.get<Record<string, unknown>>('affiliates', [user!.userId], { consistent: true });
+    if (!confirmedAffiliate) return fail('Could not verify saved affiliate record in database. Please try again.', 500);
+    return json({ affiliate: confirmedAffiliate, authorizationUrl, bankTransfer: paymentMethod === 'Bank transfer' ? { bankName: 'Moniepoint MFB', accountName: 'Yakaji Digital Hub', accountNumber: '3005758913', amount: fee, reference } : null }, 201);
   }],
   'POST /api/affiliate/paystack/verify': [requireAuth(), async ({ user, body }) => {
     const reference = String((body as { reference?: string }).reference || '').trim();
@@ -2389,7 +2488,9 @@ export const handler = router({
     const [id] = await db.tx.add('vendors', [{ id: user!.userId, shopName: b.shopName.trim(), ownerName: user!.name || user!.email || 'Vendor',
       email: user!.email || '', phone: b.phone.trim(), description: b.description.trim(), status: 'pending', createdAt: new Date().toISOString() }]);
     if (!id) return fail('Could not submit your vendor application.', 500);
-    return json({ vendor: { id, ...b, status: 'pending' } }, 201);
+    const savedVendor = await getVendor(user!.userId);
+    if (!savedVendor) return fail('Could not verify saved vendor application in database. Please try again.', 500);
+    return json({ vendor: savedVendor }, 201);
   }],
   'GET /api/vendor/wallet': [requireAuth(), async ({ user }) => {
     const vendor = await requireApprovedVendor({ user });

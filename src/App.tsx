@@ -205,6 +205,8 @@ function App() {
   const [adminSecurity, setAdminSecurity] = useState<{ ownerEmail?: string; hasEnvOverride?: boolean; hasSavedHash?: boolean; lastLoginAt?: string | null } | null>(null);
   const [adminPwForm, setAdminPwForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [adminPwBusy, setAdminPwBusy] = useState(false);
+  const [adminBackups, setAdminBackups] = useState<Array<{ id: string; backupType: string; status: string; verified: boolean; checksumSha256: string; recordCount: number; retentionDays: number; createdAt: string }>>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
   const [activeCategorySlug, setActiveCategorySlug] = useState('digital-products');
   const [affiliateApplication, setAffiliateApplication] = useState<any>(null);
   const [affiliateDashboard, setAffiliateDashboard] = useState<any>({ commissions: [], withdrawals: [], summary: {} });
@@ -448,7 +450,7 @@ function App() {
   }
   async function loadAdmin() {
     await api.post('/api/admin/products/affiliate-default', {});
-    const [v, o, p, a, s, w, u, t, c, af, announcements, mailStatus, secStatus] = await Promise.all([api.get('/api/admin/vendors'), api.get('/api/admin/orders'), api.get('/api/admin/products'), api.get('/api/admin/analytics'),api.get('/api/admin/settings'),api.get('/api/admin/withdrawals'),api.get('/api/admin/users'),api.get('/api/admin/wallet-topups'),api.get('/api/admin/coupons'),api.get('/api/admin/affiliates'),api.get('/api/admin/announcements'),api.get('/api/admin/email-status').catch(()=>({data:null})),api.get('/api/admin/security').catch(()=>({data:null}))]);
+    const [v, o, p, a, s, w, u, t, c, af, announcements, mailStatus, secStatus, bkpRes] = await Promise.all([api.get('/api/admin/vendors'), api.get('/api/admin/orders'), api.get('/api/admin/products'), api.get('/api/admin/analytics'),api.get('/api/admin/settings'),api.get('/api/admin/withdrawals'),api.get('/api/admin/users'),api.get('/api/admin/wallet-topups'),api.get('/api/admin/coupons'),api.get('/api/admin/affiliates'),api.get('/api/admin/announcements'),api.get('/api/admin/email-status').catch(()=>({data:null})),api.get('/api/admin/security').catch(()=>({data:null})),api.get('/api/admin/backups').catch(()=>({data:null}))]);
     setAdminCoupons(c.data?.coupons || []); setAffiliateData(af.data || {affiliates:[],commissions:[],withdrawals:[],summary:{}});
     setSettings(current => normalizeMarketSettings(s.data?.settings, current)); setWithdrawals(w.data?.withdrawals||[]); setAdminUsers(u.data?.users||[]); setWalletTopups(t.data?.topups||[]);
     setVendors(v.data?.vendors || []);
@@ -458,6 +460,7 @@ function App() {
     setAnnouncementHistory(announcements.data?.announcements || []);
     if (mailStatus?.data) setEmailStatus(mailStatus.data);
     if (secStatus?.data) setAdminSecurity(secStatus.data);
+    if (bkpRes?.data?.backups) setAdminBackups(bkpRes.data.backups);
   }
 
   useEffect(() => {
@@ -1624,6 +1627,48 @@ function App() {
       setError(errorText(err));
     } finally {
       setAdminPwBusy(false);
+    }
+  }
+  async function runManualBackup() {
+    setError('');
+    setBackupBusy(true);
+    try {
+      const r = await api.post('/api/admin/backups/run', {});
+      const list = await api.get('/api/admin/backups').catch(() => null);
+      if (list?.data?.backups) setAdminBackups(list.data.backups);
+      flash(r.data?.message || 'Backup completed and verified.');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+  async function verifyBackup(id: string) {
+    setError('');
+    setBackupBusy(true);
+    try {
+      const r = await api.post('/api/admin/backups/' + encodeURIComponent(id) + '/verify', {});
+      const list = await api.get('/api/admin/backups').catch(() => null);
+      if (list?.data?.backups) setAdminBackups(list.data.backups);
+      flash(r.data?.message || 'Backup integrity verified.');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+  async function restoreBackupSafe(id: string) {
+    if (!window.confirm('Recover any missing records from this verified backup without overwriting current live accounts?')) return;
+    setError('');
+    setBackupBusy(true);
+    try {
+      const r = await api.post('/api/admin/backups/' + encodeURIComponent(id) + '/restore', {});
+      await loadAdmin();
+      flash(r.data?.message || 'Safe recovery completed.');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBackupBusy(false);
     }
   }
   async function setDefaultAffiliateRates(){
@@ -2978,6 +3023,40 @@ function App() {
             <button type="submit" className="primary-btn" disabled={adminPwBusy}>{adminPwBusy ? 'Updating password...' : 'Update Owner Password'}</button>
           </form>
         )}
+      </section>
+
+      <section className="panel" id="admin-backups">
+        <div className="panel-title">
+          <div>
+            <span className="eyebrow">DATA PROTECTION · DAILY BACKUPS &amp; RECOVERY</span>
+            <h2>Automated Backups &amp; Safe Recovery ({adminBackups.length})</h2>
+            <p className="muted">Daily verified snapshots protect all customers, vendors, affiliates, wallets, products, and orders with 30-day automatic retention (90 days for manual snapshots).</p>
+          </div>
+          <button type="button" className="primary-btn" disabled={backupBusy} onClick={() => void runManualBackup()}>
+            <ShieldCheck size={16}/> {backupBusy ? 'Working...' : 'Run Verified Backup Now'}
+          </button>
+        </div>
+        <div className="compact-order-list">
+          {adminBackups.length ? adminBackups.slice(0, 10).map((b) => (
+            <div className="user-admin-card" key={b.id}>
+              <div>
+                <b>{b.backupType === 'daily_auto' ? 'Daily Automatic Backup' : b.backupType === 'pre_migration' ? 'Pre-Migration Snapshot' : 'Manual Backup'} · {b.id}</b>
+                <div className="muted">
+                  {new Date(b.createdAt).toLocaleString('en-NG')} · {b.recordCount.toLocaleString()} records · Retention: {b.retentionDays} days · SHA-256: {b.checksumSha256.slice(0, 14)}...
+                </div>
+              </div>
+              <div className="order-actions">
+                <span className={'status ' + (b.verified ? 'approved' : 'pending')}>
+                  {b.verified ? 'Verified' : b.status}
+                </span>
+                <button type="button" className="secondary-btn" disabled={backupBusy} onClick={() => void verifyBackup(b.id)}>Verify</button>
+                <button type="button" className="secondary-btn" disabled={backupBusy} onClick={() => void restoreBackupSafe(b.id)}>Safe Restore</button>
+              </div>
+            </div>
+          )) : (
+            <p className="muted">No backups recorded yet. Click "Run Verified Backup Now" to create your first verified snapshot.</p>
+          )}
+        </div>
       </section>
 
       <section className="panel" id="admin-order-history">
