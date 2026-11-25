@@ -19,7 +19,7 @@ import { VendorDashboard } from './components/VendorDashboard';
 import { AffiliateDashboard } from './components/AffiliateDashboard';
 import {
   ArrowLeft, ArrowRight, Award, BarChart3, Bell, Briefcase, Calendar, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
-  Code2, Copy, Droplets, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
+  Code2, Copy, Download, Droplets, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
   Lock, LogIn, LogOut, Megaphone, Menu, MessageCircle, MessageSquare, Package,
   PlayCircle, Plus, Search, Share2, ShieldCheck, Shirt, ShoppingBag, Star, Store, Tag,
   Trash2, TrendingUp, Truck, UploadCloud, UserRound, Users, Utensils, Wallet, X, Zap
@@ -1710,6 +1710,80 @@ function App() {
       flash(patch.status ? 'Order updated to ' + patch.status + '.' : 'Order details saved.');
     } catch (e) { setError(errorText(e)); }
   }
+  function exportActiveOrdersCsv() {
+    if (!activeAdminOrders.length) {
+      setError('There are no active orders matching the current filter to export.');
+      return;
+    }
+    const escapeCsvCell = (value: unknown, numeric = false) => {
+      let str = String(value ?? '');
+      if (!numeric && /^[=+\-@\t\r]/.test(str)) {
+        str = "'" + str;
+      }
+      return `"${str.replace(/"/g, '""')}"`;
+    };
+    const headers = [
+      'Order Number',
+      'Created At',
+      'Order Status',
+      'Payment Status',
+      'Payment Method',
+      'Payment Reference',
+      'Customer Name',
+      'Customer Email',
+      'Customer Phone',
+      'Delivery Address',
+      'Items Count',
+      'Items Summary',
+      'Subtotal (NGN)',
+      'Transfer Fee (NGN)',
+      'Total (NGN)',
+      'Courier',
+      'Tracking Number',
+      'Admin Note',
+    ];
+    const rows = activeAdminOrders.map((order) => {
+      const items = Array.isArray(order.items) ? order.items : [];
+      const itemCount = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+      const itemSummary = items
+        .map((item) => `${item.name}${item.option ? ` (${item.option})` : ''} x${item.quantity} @ ${Number(item.price || 0)}`)
+        .join(' | ');
+      const computedSubtotal = items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
+      return [
+        escapeCsvCell(order.orderNumber),
+        escapeCsvCell(order.createdAt ? new Date(order.createdAt).toISOString() : ''),
+        escapeCsvCell(order.status),
+        escapeCsvCell(order.paymentStatus || 'pending'),
+        escapeCsvCell(order.paymentMethod || ''),
+        escapeCsvCell(order.paystackReference || order.paymentReference || ''),
+        escapeCsvCell(order.customerName || ''),
+        escapeCsvCell(order.email || ''),
+        escapeCsvCell(order.phone || ''),
+        escapeCsvCell(order.address || ''),
+        escapeCsvCell(itemCount, true),
+        escapeCsvCell(itemSummary),
+        escapeCsvCell(Number(order.subtotal ?? computedSubtotal), true),
+        escapeCsvCell(Number(order.transferFee ?? 0), true),
+        escapeCsvCell(Number(order.total || 0), true),
+        escapeCsvCell(order.courier || ''),
+        escapeCsvCell(order.trackingNumber || ''),
+        escapeCsvCell(order.adminNote || ''),
+      ].join(',');
+    });
+    const csvContent = '\uFEFF' + [headers.map((h) => escapeCsvCell(h)).join(','), ...rows].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const filterSuffix = adminOrderFilter === 'all' ? '' : `-${adminOrderFilter.toLowerCase()}`;
+    link.href = url;
+    link.download = `yakaji-active-orders${filterSuffix}-${dateStamp}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    flash(`Exported ${activeAdminOrders.length} active order(s) to CSV.`);
+  }
 
   function renderCategoryIcon(slug: string, size = 18) {
     switch (slug) {
@@ -2608,6 +2682,14 @@ function App() {
             <p>Active orders in compact collapsible rows. Completed, cancelled and refunded transactions move to Order History.</p>
           </div>
           <div className="admin-support-header-actions">
+            <button
+              type="button"
+              className="secondary-btn"
+              disabled={!activeAdminOrders.length}
+              onClick={exportActiveOrdersCsv}
+            >
+              <Download size={15}/> Export CSV ({activeAdminOrders.length})
+            </button>
             <button type="button" className="secondary-btn" onClick={() => void openAdminOrderHistory()}>
               <History size={15}/> Order History ({allFulfilledOrders.length})
             </button>

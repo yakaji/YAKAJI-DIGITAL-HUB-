@@ -1,5 +1,17 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronUp, Truck, CheckCircle2 } from 'lucide-react';
+import {
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  MapPin,
+  Package,
+  PackageCheck,
+  RotateCcw,
+  Truck,
+  XCircle,
+} from 'lucide-react';
 
 export type AdminOrderItem = {
   productId: string;
@@ -69,6 +81,19 @@ const NEXT_STAGE_MAP: Record<string, { status: string; label: string }> = {
   Delivered: { status: 'Completed', label: 'Complete Order' },
 };
 
+const FULFILMENT_TIMELINE_STEPS = [
+  { status: 'New', label: 'New', icon: Clock },
+  { status: 'Confirmed', label: 'Confirmed', icon: CheckCircle2 },
+  { status: 'Processing', label: 'Processing', icon: Package },
+  { status: 'Ready for Shipping', label: 'Ready', icon: PackageCheck },
+  { status: 'Shipped', label: 'Shipped', icon: Truck },
+  { status: 'Out for Delivery', label: 'Out for Delivery', icon: MapPin },
+  { status: 'Delivered', label: 'Delivered', icon: Check },
+  { status: 'Completed', label: 'Completed', icon: CheckCircle2 },
+] as const;
+
+const EXCEPTION_STATUSES = new Set(['Cancelled', 'Returned', 'Refunded']);
+
 export function isFulfilledOrderStatus(status?: string): boolean {
   return ['Completed', 'Cancelled', 'Refunded', 'Returned'].includes(String(status || ''));
 }
@@ -127,6 +152,12 @@ export function AdminOrderRow({
   const canVerifyPayment =
     order.paymentStatus !== 'completed' && !['Cancelled', 'Refunded'].includes(order.status);
   const nextStage = NEXT_STAGE_MAP[order.status];
+  const isExceptionStatus = EXCEPTION_STATUSES.has(order.status);
+  const timelineIndex = FULFILMENT_TIMELINE_STEPS.findIndex(step => step.status === order.status);
+  const activeStepIndex = timelineIndex >= 0 ? timelineIndex : 0;
+  const progressPercent = isExceptionStatus
+    ? 100
+    : Math.round(((activeStepIndex + 1) / FULFILMENT_TIMELINE_STEPS.length) * 100);
 
   async function saveTracking(markShipped = false) {
     if (!onUpdateOrder) {
@@ -244,6 +275,95 @@ export function AdminOrderRow({
             )}
           </button>
         </div>
+      </div>
+
+      <div
+        className={'order-progress-timeline' + (isExceptionStatus ? ' is-exception' : '')}
+        aria-label={`Order ${order.orderNumber} progress: ${order.status}`}
+      >
+        <div className="order-timeline-meta">
+          <span className="order-timeline-summary">
+            {isExceptionStatus ? (
+              <>
+                {order.status === 'Cancelled' ? <XCircle size={13} /> : <RotateCcw size={13} />}
+                <span>Order {order.status}</span>
+              </>
+            ) : (
+              <>
+                <span>
+                  Stage {activeStepIndex + 1} of {FULFILMENT_TIMELINE_STEPS.length}: <b>{order.status}</b>
+                </span>
+              </>
+            )}
+          </span>
+          <span className="order-timeline-percent tabular-nums">
+            {isExceptionStatus ? order.status : `${progressPercent}%`}
+          </span>
+        </div>
+
+        <ol className="order-timeline-steps">
+          {FULFILMENT_TIMELINE_STEPS.map((step, index) => {
+            const StepIcon = step.icon;
+            const isCompletedStage = order.status === 'Completed' && index === FULFILMENT_TIMELINE_STEPS.length - 1;
+            const state = isExceptionStatus
+              ? 'halted'
+              : isCompletedStage || index < activeStepIndex
+                ? 'done'
+                : index === activeStepIndex
+                  ? 'current'
+                  : 'upcoming';
+            const canClickStep = mode !== 'payment';
+            return (
+              <li key={step.status} className={`order-timeline-step is-${state}`}>
+                {index > 0 && (
+                  <span
+                    className={
+                      'order-timeline-connector' +
+                      (!isExceptionStatus && index <= activeStepIndex ? ' is-filled' : '')
+                    }
+                    aria-hidden="true"
+                  />
+                )}
+                {canClickStep ? (
+                  <button
+                    type="button"
+                    className="order-timeline-step-btn"
+                    title={`Set ${order.orderNumber} to ${step.status}`}
+                    aria-label={`Set order ${order.orderNumber} status to ${step.status}`}
+                    aria-current={state === 'current' ? 'step' : undefined}
+                    onClick={() => onChangeStatus(order.id, step.status)}
+                  >
+                    <span className="order-timeline-node">
+                      {state === 'done' ? <Check size={11} strokeWidth={3} /> : <StepIcon size={11} />}
+                    </span>
+                    <span className="order-timeline-label">{step.label}</span>
+                  </button>
+                ) : (
+                  <div
+                    className="order-timeline-step-btn is-readonly"
+                    aria-current={state === 'current' ? 'step' : undefined}
+                  >
+                    <span className="order-timeline-node">
+                      {state === 'done' ? <Check size={11} strokeWidth={3} /> : <StepIcon size={11} />}
+                    </span>
+                    <span className="order-timeline-label">{step.label}</span>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+          {isExceptionStatus && (
+            <li className="order-timeline-step is-exception-end">
+              <span className="order-timeline-connector is-exception-line" aria-hidden="true" />
+              <div className="order-timeline-step-btn is-readonly" aria-current="step">
+                <span className="order-timeline-node">
+                  {order.status === 'Cancelled' ? <XCircle size={11} /> : <RotateCcw size={11} />}
+                </span>
+                <span className="order-timeline-label">{order.status}</span>
+              </div>
+            </li>
+          )}
+        </ol>
       </div>
 
       {expanded && (
