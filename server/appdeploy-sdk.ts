@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Request, Response } from 'express';
 import type { PoolClient } from 'pg';
-import { pool, withDbRetry } from '../src/db/index.ts';
+import { pool, withDbRetry, withPoolClient } from '../src/db/index.ts';
 import { ensureDailyBackupFresh, runDatabaseBackup } from './backup-service.ts';
 
 export type AuthUser = {
@@ -1061,20 +1061,19 @@ async function executeOpOnClient(
 
 async function runSingleOp(op: TxOp): Promise<boolean[]> {
   await ensureInitialized();
-  return withDbRetry(async () => {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const results = await executeOpOnClient(client, op, false);
-      await client.query('COMMIT');
-      return results;
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      client.release();
-    }
-  });
+  return withDbRetry(() =>
+    withPoolClient(async (client) => {
+      try {
+        await client.query('BEGIN');
+        const results = await executeOpOnClient(client, op, false);
+        await client.query('COMMIT');
+        return results;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
+    })
+  );
 }
 
 type LazyTxPromise<T> = Promise<T> & { __txOp: TxOp };
@@ -1123,10 +1122,10 @@ function walkMediaFiles(dir: string, prefix = ''): Array<{ relPath: string; full
 }
 
 async function runLazyInitialization(): Promise<void> {
-  await withDbRetry(async () => {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+  await withDbRetry(() =>
+    withPoolClient(async (client) => {
+      try {
+        await client.query('BEGIN');
 
       // 1. Safe, non-destructive migration of any existing records in .yakaji-data/db.json
       let migratedLegacyCount = 0;
@@ -1350,10 +1349,9 @@ async function runLazyInitialization(): Promise<void> {
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;
-    } finally {
-      client.release();
     }
-  });
+    })
+  );
 
   // Schedule daily backup check non-blockingly after lazy database initialization
   void ensureDailyBackupFresh();
@@ -1470,21 +1468,20 @@ export const db = {
       }
     }
     if (!ops.length) return;
-    await withDbRetry(async () => {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        for (const op of ops) {
-          await executeOpOnClient(client, op, true);
+    await withDbRetry(() =>
+      withPoolClient(async (client) => {
+        try {
+          await client.query('BEGIN');
+          for (const op of ops) {
+            await executeOpOnClient(client, op, true);
+          }
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
         }
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      } finally {
-        client.release();
-      }
-    });
+      })
+    );
   },
 };
 

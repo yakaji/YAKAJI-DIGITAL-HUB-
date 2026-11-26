@@ -529,6 +529,85 @@ async function requireApprovedVendor(ctx: { user?: { userId: string } }) {
   if (!v || v.status !== 'approved') return null;
   return v;
 }
+async function hydrateVendorShops(
+  vendorRows: Array<Record<string, unknown>>,
+  opts: {
+    viewerUserId?: string;
+    includePrivate?: boolean;
+    follows?: Array<Record<string, unknown>>;
+    products?: Array<Record<string, unknown>>;
+    reviewStats?: Map<string, ReviewStats>;
+  } = {}
+) {
+  if (!vendorRows.length) return [];
+  const [follows, products, reviews] = await Promise.all([
+    opts.follows ? Promise.resolve(opts.follows) : listAll<Record<string, unknown>>('shop_follows'),
+    opts.products ? Promise.resolve(opts.products) : listAll<Record<string, unknown>>('products'),
+    opts.reviewStats ? Promise.resolve(null) : listAll<Record<string, unknown>>('product_reviews'),
+  ]);
+  const reviewStats = opts.reviewStats || buildReviewStatsMap(reviews || []);
+  const mediaPaths = [...new Set(
+    vendorRows
+      .flatMap(v => [String(v.iconPath || ''), String(v.coverPath || '')])
+      .filter(Boolean)
+  )];
+  const mediaUrls = mediaPaths.length ? await storage.url(mediaPaths) : [];
+  const urlByPath = new Map(mediaUrls.map(item => [item.path, item.url]));
+
+  return vendorRows.map(v => {
+    const vid = String(v.id || '');
+    const iconPath = String(v.iconPath || '');
+    const coverPath = String(v.coverPath || '');
+    const shopFollows = follows.filter(f => String(f.vendorId || '') === vid);
+    const approvedProducts = products.filter(p => String(p.vendorId || '') === vid && p.status === 'approved');
+    let ratingSum = 0;
+    let reviewCount = 0;
+    for (const p of approvedProducts) {
+      const st = reviewStats.get(String(p.id || ''));
+      if (st) {
+        ratingSum += st.sum;
+        reviewCount += st.count;
+      }
+    }
+    const averageRating = reviewCount > 0 ? Math.round((ratingSum / reviewCount) * 10) / 10 : 0;
+    const base = {
+      id: vid,
+      shopName: String(v.shopName || 'Vendor Shop'),
+      ownerName: String(v.ownerName || 'Merchant'),
+      description: String(v.description || ''),
+      tagline: String(v.tagline || ''),
+      specialty: String(v.specialty || ''),
+      location: String(v.location || ''),
+      city: String(v.city || ''),
+      state: String(v.state || ''),
+      phone: String(v.phone || ''),
+      whatsapp: String(v.whatsapp || ''),
+      returnPolicy: String(v.returnPolicy || ''),
+      iconPath,
+      coverPath,
+      iconUrl: iconPath ? (urlByPath.get(iconPath) || '') : '',
+      coverUrl: coverPath ? (urlByPath.get(coverPath) || '') : '',
+      followerCount: shopFollows.length,
+      productCount: approvedProducts.length,
+      averageRating,
+      reviewCount,
+      isFollowed: opts.viewerUserId
+        ? shopFollows.some(f => String(f.userId || '') === opts.viewerUserId)
+        : false,
+      createdAt: String(v.createdAt || ''),
+      updatedAt: String(v.updatedAt || v.createdAt || ''),
+    };
+    if (opts.includePrivate) {
+      return {
+        ...v,
+        ...base,
+        email: String(v.email || ''),
+        status: String(v.status || 'pending'),
+      };
+    }
+    return base;
+  });
+}
 async function listAll<T extends Record<string, unknown>>(table: string): Promise<Array<T & { id: string }>> {
   const items: Array<T & { id: string }> = [];
   let nextToken: string | undefined;
@@ -577,6 +656,116 @@ const publicProduct = async (p: Record<string, unknown>, stats?: ReviewStats) =>
     images: ((p.images as string[]) || []).map(x => byPath.get(x) || ''),
     videos: ((p.videos as string[]) || []).map(x => byPath.get(x) || '') };
 };
+
+async function enrichAdminOrders(
+  orders: OrderRecord[],
+  deps: {
+    vendors: Array<Record<string, unknown>>;
+    products: Array<Record<string, unknown>>;
+    profiles: Array<Record<string, unknown>>;
+    authUsers: Array<Record<string, unknown>>;
+    affiliates: Array<Record<string, unknown>>;
+  }
+) {
+  const vendorById = new Map(deps.vendors.map(v => [String(v.id), v]));
+  const productById = new Map(deps.products.map(p => [String(p.id), p]));
+  const profileById = new Map(deps.profiles.map(p => [String(p.id), p]));
+  const authById = new Map(deps.authUsers.map(u => [String(u.id), u]));
+  const profileByEmail = new Map<string, Record<string, unknown>>();
+  for (const p of deps.profiles) {
+    const email = String(p.email || '').trim().toLowerCase();
+    if (email && !profileByEmail.has(email)) profileByEmail.set(email, p);
+  }
+  const authByEmail = new Map<string, Record<string, unknown>>();
+  for (const u of deps.authUsers) {
+    const email = String(u.email || '').trim().toLowerCase();
+    if (email && !authByEmail.has(email)) authByEmail.set(email, u);
+  }
+  const affiliateById = new Map(deps.affiliates.map(a => [String(a.id), a]));
+  const affiliateByCode = new Map<string, Record<string, unknown>>();
+  for (const a of deps.affiliates) {
+    const code = String(a.referralCode || '').trim().toUpperCase();
+    if (code) affiliateByCode.set(code, a);
+  }
+
+  const orderCountByCustomerKey = new Map<string, { total: number; paid: number }>();
+  for (const o of orders) {
+    const uid = String(o.customerUserId || '').trim();
+    const email = String(o.email || '').trim().toLowerCase();
+    const keys = [uid ? `id:${uid}` : '', email ? `email:${email}` : ''].filter(Boolean);
+    for (const k of keys) {
+      const entry = orderCountByCustomerKey.get(k) || { total: 0, paid: 0 };
+      entry.total += 1;
+      if (o.paymentStatus === 'completed') entry.paid += 1;
+      orderCountByCustomerKey.set(k, entry);
+    }
+  }
+
+  const firstImagePaths = [
+    ...new Set(
+      deps.products
+        .map(p => (Array.isArray(p.images) && p.images[0] ? String(p.images[0]) : ''))
+        .filter(Boolean)
+    ),
+  ];
+  const signedImages = firstImagePaths.length ? await storage.url(firstImagePaths) : [];
+  const imageUrlByPath = new Map(signedImages.map(entry => [entry.path, entry.url]));
+
+  return orders.map(order => {
+    const items = Array.isArray(order.items) ? order.items : [];
+    const enrichedItems = items.map(item => {
+      const product = productById.get(String(item.productId || ''));
+      const vendor = vendorById.get(String(item.vendorId || product?.vendorId || ''));
+      const firstPath = Array.isArray(product?.images) && product.images[0] ? String(product.images[0]) : '';
+      return {
+        ...item,
+        vendorShopName: String(vendor?.shopName || vendor?.ownerName || (item as Record<string, unknown>).vendorShopName || ''),
+        productCategory: String(product?.category || ''),
+        productImage: firstPath ? imageUrlByPath.get(firstPath) || '' : '',
+      };
+    });
+
+    const customerUserId = String(order.customerUserId || '').trim();
+    const orderEmail = String(order.email || '').trim().toLowerCase();
+    const profile =
+      (customerUserId ? profileById.get(customerUserId) : undefined) ||
+      (orderEmail ? profileByEmail.get(orderEmail) : undefined);
+    const authRec =
+      (customerUserId ? authById.get(customerUserId) : undefined) ||
+      (orderEmail ? authByEmail.get(orderEmail) : undefined);
+    const stats =
+      (customerUserId ? orderCountByCustomerKey.get(`id:${customerUserId}`) : undefined) ||
+      (orderEmail ? orderCountByCustomerKey.get(`email:${orderEmail}`) : undefined);
+    const resolvedUserId = String(profile?.id || authRec?.id || customerUserId || '');
+
+    const affiliate =
+      (order.affiliateId ? affiliateById.get(String(order.affiliateId)) : undefined) ||
+      (order.affiliateReferralCode
+        ? affiliateByCode.get(String(order.affiliateReferralCode).trim().toUpperCase())
+        : undefined);
+
+    return {
+      ...order,
+      items: enrichedItems,
+      affiliateName: affiliate ? String(affiliate.fullName || affiliate.name || '') : '',
+      customerAccount: {
+        userId: resolvedUserId,
+        fullName: String(profile?.fullName || authRec?.fullName || order.customerName || ''),
+        email: String(profile?.email || authRec?.email || order.email || ''),
+        phone: String(profile?.phone || authRec?.phone || order.phone || ''),
+        whatsapp: String(profile?.whatsapp || ''),
+        address: String(profile?.address || order.address || ''),
+        city: String(profile?.city || ''),
+        state: String(profile?.state || ''),
+        country: String(profile?.country || 'Nigeria'),
+        totalOrders: stats?.total || 1,
+        paidOrders: stats?.paid || (order.paymentStatus === 'completed' ? 1 : 0),
+        isGuest: !resolvedUserId,
+      },
+    };
+  });
+}
+
 function inPeriod(dateValue: unknown, period: 'day' | 'week' | 'month' | 'year') {
   const date = new Date(String(dateValue || ''));
   if (Number.isNaN(date.getTime())) return false;
@@ -1043,6 +1232,93 @@ async function initializeWalletTopup(topup: Record<string, unknown>) {
     throw new Error(result.message || 'Paystack could not start this wallet top-up.');
   }
   return { authorizationUrl: result.data.authorization_url, reference: result.data.reference };
+}
+
+const ALLOWED_ORDER_STATUSES = [
+  'New',
+  'Confirmed',
+  'Processing',
+  'Ready for Shipping',
+  'Shipped',
+  'Out for Delivery',
+  'Delivered',
+  'Completed',
+  'Cancelled',
+  'Returned',
+  'Refunded',
+] as const;
+
+async function applyOrderStatusEffects(
+  existing: OrderRecord,
+  latestOrder: OrderRecord,
+  nextStatus: string
+) {
+  if (nextStatus !== existing.status) {
+    const orderMessage = 'Your order ' + String(existing.orderNumber) + ' is now ' + nextStatus + '.';
+    if (existing.customerUserId) {
+      await notifyUser(
+        String(existing.customerUserId),
+        'Order status updated',
+        orderMessage,
+        'order',
+        '/?view=orders&orderId=' + encodeURIComponent(existing.id)
+      );
+    }
+    const vendorIds = [
+      ...new Set(
+        (Array.isArray(existing.items) ? existing.items : [])
+          .map((item: OrderItem) => String(item.vendorId || ''))
+          .filter(Boolean)
+      ),
+    ];
+    for (const vendorId of vendorIds) {
+      await notifyUser(
+        vendorId,
+        'Order status updated',
+        'Order ' + String(existing.orderNumber) + ' is now ' + nextStatus + '.',
+        'order',
+        '/'
+      );
+    }
+  }
+
+  if (latestOrder.status === 'Completed' && latestOrder.paymentStatus === 'completed') {
+    await recordAffiliateCommissions(latestOrder);
+  }
+
+  const completedCustomerEmail = await resolveOrderCustomerEmail(latestOrder);
+  if (
+    nextStatus !== existing.status &&
+    nextStatus === 'Completed' &&
+    completedCustomerEmail &&
+    !existing.customerCompletedEmailSentAt
+  ) {
+    const html = emailShell(
+      'YAKAJI DIGITAL HUB · ORDER COMPLETED',
+      `Your order ${String(existing.orderNumber || '')} is completed`,
+      'Thank you for shopping with Yakaji Digital Hub',
+      `<p>Hello <b>${htmlSafe(existing.customerName)}</b>,</p><p>Your Yakaji Digital Hub order <b>${htmlSafe(existing.orderNumber)}</b> (Total: <b>${money(existing.total)}</b>) has been marked as <b>Completed</b>.</p><p>Thank you for choosing Yakaji Digital Hub!</p>`
+    );
+    const sent = await sendEmail(
+      completedCustomerEmail,
+      `Your order ${existing.orderNumber} is completed`,
+      html,
+      {
+        role: 'customer',
+        orderId: existing.id,
+        orderNumber: String(existing.orderNumber || ''),
+        recipientName: String(existing.customerName || ''),
+        trigger: 'order_completed',
+      }
+    );
+    if (sent.sent) {
+      await db.tx.update(
+        'orders',
+        [{ id: existing.id, record: { customerCompletedEmailSentAt: new Date().toISOString() } }],
+        { patch: true }
+      );
+    }
+  }
 }
 
 export const handler = router({
@@ -2476,9 +2752,176 @@ export const handler = router({
     const [ok] = await db.tx.update('affiliates', [{ id: params.id, record: { registrationPaymentStatus: 'paid', paidAt: new Date().toISOString(), paymentConfirmedBy: user!.userId }, if: { registrationPaymentStatus: 'pending_confirmation' } }], { patch: true });
     return ok ? json({ confirmed: true }) : fail('Could not confirm the affiliate transfer.', 409);
   }],
+  'GET /api/shops': [async ({ user }) => {
+    const vendors = (await listAll<Record<string, unknown>>('vendors')).filter(v => v.status === 'approved');
+    const shops = await hydrateVendorShops(vendors, { viewerUserId: user?.userId });
+    const followedShopIds = shops.filter(s => s.isFollowed).map(s => s.id);
+    return json({ shops, followedShopIds });
+  }],
+  'GET /api/shops/:id': [async ({ params, user }) => {
+    const vendor = await getVendor(params.id);
+    if (!vendor || vendor.status !== 'approved') return fail('Vendor shop not found.', 404);
+    const [follows, allProducts, allReviews] = await Promise.all([
+      listAll<Record<string, unknown>>('shop_follows'),
+      listAll<Record<string, unknown>>('products'),
+      listAll<Record<string, unknown>>('product_reviews'),
+    ]);
+    const reviewStats = buildReviewStatsMap(allReviews);
+    const [shop] = await hydrateVendorShops([vendor], {
+      viewerUserId: user?.userId,
+      follows,
+      products: allProducts,
+      reviewStats,
+    });
+    const shopProductRows = allProducts.filter(p => String(p.vendorId || '') === params.id && p.status === 'approved');
+    const products = await Promise.all(shopProductRows.map(p => publicProduct(p, reviewStats.get(String(p.id || '')))));
+    return json({ shop, products });
+  }],
+  'GET /api/customer/followed-shops': [requireAuth(), async ({ user }) => {
+    const [follows, vendors] = await Promise.all([
+      listAll<Record<string, unknown>>('shop_follows'),
+      listAll<Record<string, unknown>>('vendors'),
+    ]);
+    const myFollows = follows.filter(f => String(f.userId || '') === user!.userId);
+    const followedSet = new Set(myFollows.map(f => String(f.vendorId || '')));
+    const approvedFollowedVendors = vendors.filter(v => v.status === 'approved' && followedSet.has(String(v.id || '')));
+    const shops = await hydrateVendorShops(approvedFollowedVendors, { viewerUserId: user!.userId, follows });
+    return json({
+      followedShopIds: shops.map(s => s.id),
+      shops,
+    });
+  }],
+  'POST /api/shops/:id/follow': [requireAuth(), async ({ user, params }) => {
+    const vendor = await getVendor(params.id);
+    if (!vendor || vendor.status !== 'approved') return fail('Vendor shop not found.', 404);
+    const followId = `${user!.userId}::${params.id}`;
+    const [existing] = await db.get<Record<string, unknown>>('shop_follows', [followId], { consistent: true });
+    if (!existing) {
+      const [saved] = await db.tx.add('shop_follows', [{
+        id: followId,
+        userId: user!.userId,
+        vendorId: params.id,
+        followerName: String(user!.name || 'Marketplace customer'),
+        createdAt: new Date().toISOString(),
+      }]);
+      if (!saved) return fail('Could not follow this shop. Please try again.', 500);
+      if (params.id !== user!.userId) {
+        await notifyUser(
+          params.id,
+          'New shop follower',
+          `${String(user!.name || 'A customer')} started following ${String(vendor.shopName || 'your shop')}.`,
+          'shop',
+          '/'
+        );
+      }
+    }
+    const allFollows = await listAll<Record<string, unknown>>('shop_follows');
+    const followerCount = allFollows.filter(f => String(f.vendorId || '') === params.id).length;
+    return json({ followed: true, vendorId: params.id, followerCount }, existing ? 200 : 201);
+  }],
+  'DELETE /api/shops/:id/follow': [requireAuth(), async ({ user, params }) => {
+    const vendor = await getVendor(params.id);
+    if (!vendor || vendor.status !== 'approved') return fail('Vendor shop not found.', 404);
+    const followId = `${user!.userId}::${params.id}`;
+    const [existing] = await db.get<Record<string, unknown>>('shop_follows', [followId], { consistent: true });
+    if (existing) {
+      await db.delete('shop_follows', [followId]);
+    }
+    const allFollows = await listAll<Record<string, unknown>>('shop_follows');
+    const followerCount = allFollows.filter(f => String(f.vendorId || '') === params.id).length;
+    return json({ followed: false, vendorId: params.id, followerCount });
+  }],
   'GET /api/vendor/me': [requireAuth(), async ({ user }) => {
     const vendor = await getVendor(user!.userId);
-    return json({ vendor: vendor ? { ...vendor, id: user!.userId } : null });
+    if (!vendor) return json({ vendor: null });
+    const [hydrated] = await hydrateVendorShops([{ ...vendor, id: user!.userId }], {
+      viewerUserId: user!.userId,
+      includePrivate: true,
+    });
+    return json({ vendor: hydrated || { ...vendor, id: user!.userId } });
+  }],
+  'PUT /api/vendor/profile': [requireAuth(), async ({ user, body }) => {
+    const existing = await requireApprovedVendor({ user });
+    if (!existing) return fail('Your vendor shop must be approved before editing your storefront profile.', 403);
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+    const shopName = String(b.shopName ?? existing.shopName ?? '').trim();
+    const phone = String(b.phone ?? existing.phone ?? '').trim();
+    const whatsapp = String(b.whatsapp ?? existing.whatsapp ?? '').trim().slice(0, 30);
+    const description = String(b.description ?? existing.description ?? '').trim();
+    const tagline = String(b.tagline ?? existing.tagline ?? '').trim().slice(0, 140);
+    const specialty = String(b.specialty ?? existing.specialty ?? '').trim().slice(0, 80);
+    const location = String(b.location ?? existing.location ?? '').trim().slice(0, 120);
+    const city = String(b.city ?? existing.city ?? '').trim().slice(0, 80);
+    const state = String(b.state ?? existing.state ?? '').trim().slice(0, 80);
+    const returnPolicy = String(b.returnPolicy ?? existing.returnPolicy ?? '').trim().slice(0, 600);
+    if (shopName.length < 2 || shopName.length > 100) return fail('Shop name must be between 2 and 100 characters.');
+    if (phone.length < 5 || phone.length > 30) return fail('Enter a valid shop phone number.');
+    if (description.length < 5 || description.length > 1500) return fail('Shop bio / description must be between 5 and 1,500 characters.');
+    const patchRecord: Record<string, unknown> = {
+      shopName,
+      phone,
+      whatsapp,
+      description,
+      tagline,
+      specialty,
+      location,
+      city,
+      state,
+      returnPolicy,
+      updatedAt: new Date().toISOString(),
+    };
+    if (b.iconPath === '') patchRecord.iconPath = '';
+    if (b.coverPath === '') patchRecord.coverPath = '';
+    const [ok] = await db.tx.update('vendors', [{ id: user!.userId, record: patchRecord }], { patch: true });
+    if (!ok) return fail('Could not save your shop profile changes.', 500);
+    if (shopName !== String(existing.shopName || '')) {
+      const vendorProducts = (await listAll<Record<string, unknown>>('products')).filter(p => String(p.vendorId || '') === user!.userId);
+      if (vendorProducts.length) {
+        await db.tx.update('products', vendorProducts.map(p => ({ id: p.id, record: { vendorName: shopName } })), { patch: true });
+      }
+    }
+    const updatedVendor = await getVendor(user!.userId);
+    const [hydrated] = updatedVendor
+      ? await hydrateVendorShops([{ ...updatedVendor, id: user!.userId }], { viewerUserId: user!.userId, includePrivate: true })
+      : [null];
+    return json({ vendor: hydrated, message: 'Your shop profile has been updated.' });
+  }],
+  'POST /api/vendor/shop-media': [requireAuth(), async ({ user, body }) => {
+    const existing = await requireApprovedVendor({ user });
+    if (!existing) return fail('Your vendor shop must be approved before uploading shop images.', 403);
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      kind?: string;
+      fileName?: string;
+      contentType?: string;
+      base64?: string;
+    };
+    const kind = b.kind === 'cover' ? 'cover' : b.kind === 'icon' ? 'icon' : '';
+    if (!kind) return fail('Specify whether you are uploading a shop icon or cover image.');
+    if (!b.base64 || !String(b.contentType || '').startsWith('image/')) return fail('Choose a valid image file (PNG, JPG or WebP).');
+    if (b.base64.length > 11200000) return fail('Shop images must be 8MB or smaller.');
+    const safeName = String(b.fileName || `${kind}-image`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const folder = kind === 'icon' ? 'shop-icons' : 'shop-covers';
+    const path = `${folder}/${user!.userId}/${safeId()}-${safeName}`;
+    const [written] = await storage.write([{ path, content: b.base64, contentType: String(b.contentType) }]);
+    if (!written) return fail('Image upload failed. Please try again.', 500);
+    const fieldPatch = kind === 'icon' ? { iconPath: path } : { coverPath: path };
+    const [saved] = await db.tx.update('vendors', [{
+      id: user!.userId,
+      record: { ...fieldPatch, updatedAt: new Date().toISOString() },
+    }], { patch: true });
+    if (!saved) return fail('Could not link uploaded image to your shop.', 500);
+    const [signed] = await storage.url([path]);
+    const updatedVendor = await getVendor(user!.userId);
+    const [hydrated] = updatedVendor
+      ? await hydrateVendorShops([{ ...updatedVendor, id: user!.userId }], { viewerUserId: user!.userId, includePrivate: true })
+      : [null];
+    return json({
+      kind,
+      path,
+      url: signed?.url || '',
+      vendor: hydrated,
+      message: kind === 'icon' ? 'Shop icon updated successfully.' : 'Shop cover image updated successfully.',
+    });
   }],
   'POST /api/vendor/apply': [requireAuth(), async ({ user, body }) => {
     const b = body as { shopName?: string; phone?: string; description?: string };
@@ -2845,15 +3288,23 @@ export const handler = router({
   }],
 
   'GET /api/admin/users': [...admin, async () => {
-    const [profiles, authUsers, orders, vendors, wallets, affiliates, resets] = await Promise.all([
+    const [profiles, authUsers, orders, vendors, products, wallets, affiliates, resets] = await Promise.all([
       listAll<Record<string, unknown>>('profiles'),
       listAll<Record<string, unknown>>('users'),
       listAll<OrderRecord>('orders'),
       listAll<Record<string, unknown>>('vendors'),
+      listAll<Record<string, unknown>>('products'),
       listAll<Record<string, unknown>>('wallet_accounts'),
       listAll<Record<string, unknown>>('affiliates'),
       listAll<Record<string, unknown>>('password_resets'),
     ]);
+    const enrichedOrders = await enrichAdminOrders(orders, {
+      vendors,
+      products,
+      profiles,
+      authUsers,
+      affiliates,
+    });
     const authById = new Map(authUsers.map(u => [u.id, u]));
     const profileById = new Map(profiles.map(p => [p.id, p]));
     const walletById = new Map(wallets.map(w => [w.id, w]));
@@ -2871,7 +3322,7 @@ export const handler = router({
       const email = String(profile.email || authRec?.email || '').trim().toLowerCase();
       const fullName = String(profile.fullName || authRec?.fullName || '').trim();
       const phone = String(profile.phone || authRec?.phone || '').trim();
-      const userOrders = orders
+      const userOrders = enrichedOrders
         .filter(order => String(order.customerUserId || '') === id || (email && String(order.email || '').trim().toLowerCase() === email))
         .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
       const vendor = vendors.find(item => item.id === id);
@@ -2906,15 +3357,8 @@ export const handler = router({
         orderCount: userOrders.length,
         paidOrderCount: userOrders.filter(order => order.paymentStatus === 'completed').length,
         totalSpent: userOrders.filter(order => order.paymentStatus === 'completed').reduce((sum, order) => sum + Number(order.total || 0), 0),
-        recentOrders: userOrders.slice(0, 5).map(order => ({
-          id: order.id,
-          orderNumber: order.orderNumber,
-          total: Number(order.total || 0),
-          status: order.status,
-          paymentStatus: order.paymentStatus || 'pending',
-          paymentMethod: order.paymentMethod || '',
-          createdAt: order.createdAt,
-        })),
+        orders: userOrders,
+        recentOrders: userOrders.slice(0, 5),
         vendorStatus: vendor ? String(vendor.status || 'registered') : 'customer',
         shopName: vendor ? String(vendor.shopName || '') : '',
         affiliateStatus: affiliate ? String(affiliate.status || 'pending') : 'none',
@@ -3211,8 +3655,23 @@ export const handler = router({
     return ok ? json({ deleted: true }) : fail('Product not found.', 404);
   }],
   'GET /api/admin/orders': [...admin, async () => {
-    const orders = (await listAll<OrderRecord>('orders')).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-    return json({ orders });
+    const [orders, vendors, products, profiles, authUsers, affiliates] = await Promise.all([
+      listAll<OrderRecord>('orders'),
+      listAll<Record<string, unknown>>('vendors'),
+      listAll<Record<string, unknown>>('products'),
+      listAll<Record<string, unknown>>('profiles'),
+      listAll<Record<string, unknown>>('users'),
+      listAll<Record<string, unknown>>('affiliates'),
+    ]);
+    const sorted = orders.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const enriched = await enrichAdminOrders(sorted, {
+      vendors,
+      products,
+      profiles,
+      authUsers,
+      affiliates,
+    });
+    return json({ orders: enriched });
   }],
   'GET /api/admin/analytics': [...admin, async () => {
     const orders = await listAll<OrderRecord>('orders');
@@ -3474,6 +3933,79 @@ export const handler = router({
           : 'Email delivery attempted.'
     });
   }],
+  'PUT /api/admin/orders/bulk-status': [...admin, async ({ body }) => {
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      orderIds?: unknown;
+      status?: unknown;
+    };
+    const rawIds = Array.isArray(b.orderIds) ? b.orderIds : [];
+    const uniqueIds = [...new Set(rawIds.map(id => String(id || '').trim()).filter(Boolean))];
+    if (!uniqueIds.length) {
+      return fail('Select at least one order to update.');
+    }
+    if (uniqueIds.length > 200) {
+      return fail('You can update up to 200 orders in a single batch.');
+    }
+
+    const nextStatus = String(b.status || '').trim();
+    if (!ALLOWED_ORDER_STATUSES.includes(nextStatus as (typeof ALLOWED_ORDER_STATUSES)[number])) {
+      return fail('Choose a valid order status.');
+    }
+
+    const existingRows = await db.get<OrderRecord>('orders', uniqueIds, { consistent: true });
+    const existingById = new Map<string, OrderRecord>();
+    for (const row of existingRows) {
+      if (row?.id) existingById.set(String(row.id), row);
+    }
+
+    const foundOrders = uniqueIds.map(id => existingById.get(id)).filter((row): row is OrderRecord => Boolean(row));
+    if (!foundOrders.length) {
+      return fail('No matching orders were found.', 404);
+    }
+
+    const missingIds = uniqueIds.filter(id => !existingById.has(id));
+    const ordersToUpdate = foundOrders.filter(order => String(order.status || '') !== nextStatus);
+    const unchangedCount = foundOrders.length - ordersToUpdate.length;
+    const now = new Date().toISOString();
+
+    if (ordersToUpdate.length > 0) {
+      const batchOps = ordersToUpdate.map(order => ({
+        id: order.id,
+        record: {
+          status: nextStatus,
+          updatedAt: now,
+        },
+      }));
+      const updateResults = await db.tx.update('orders', batchOps, { patch: true });
+      if (updateResults.some(ok => !ok)) {
+        return fail('One or more selected orders could not be updated. Please refresh and try again.', 500);
+      }
+
+      for (const existing of ordersToUpdate) {
+        const latestOrder = { ...existing, status: nextStatus, updatedAt: now } as OrderRecord;
+        try {
+          await applyOrderStatusEffects(existing, latestOrder, nextStatus);
+        } catch (effectError) {
+          console.error('Bulk order post-update effect warning:', existing.id, effectError);
+        }
+      }
+    }
+
+    const refreshedRows = await db.get<OrderRecord>('orders', foundOrders.map(o => o.id), { consistent: true });
+    return json({
+      updated: true,
+      status: nextStatus,
+      updatedCount: ordersToUpdate.length,
+      unchangedCount,
+      missingIds,
+      orders: refreshedRows,
+      message:
+        ordersToUpdate.length > 0
+          ? `Updated ${ordersToUpdate.length} order${ordersToUpdate.length === 1 ? '' : 's'} to ${nextStatus}.` +
+            (unchangedCount > 0 ? ` (${unchangedCount} already at ${nextStatus}.)` : '')
+          : `All ${unchangedCount} selected order${unchangedCount === 1 ? ' is' : 's are'} already set to ${nextStatus}.`,
+    });
+  }],
   'PUT /api/admin/orders/:id': [...admin, async ({ params, body, user }) => {
     const b = (body && typeof body === 'object' ? body : {}) as {
       status?: string;
@@ -3485,10 +4017,9 @@ export const handler = router({
     const [existing] = await db.get<OrderRecord>('orders', [params.id], { consistent: true });
     if (!existing) return fail('Order not found.', 404);
 
-    const allowedStatuses = ['New', 'Confirmed', 'Processing', 'Ready for Shipping', 'Shipped', 'Out for Delivery', 'Delivered', 'Completed', 'Cancelled', 'Returned', 'Refunded'];
     const hasStatusChange = b.status !== undefined && String(b.status) !== '';
     const nextStatus = hasStatusChange ? String(b.status) : String(existing.status);
-    if (hasStatusChange && !allowedStatuses.includes(nextStatus)) {
+    if (hasStatusChange && !ALLOWED_ORDER_STATUSES.includes(nextStatus as (typeof ALLOWED_ORDER_STATUSES)[number])) {
       return fail('Invalid order status.');
     }
 
@@ -3522,17 +4053,6 @@ export const handler = router({
     const [updatedOrder] = await db.get<OrderRecord>('orders', [params.id], { consistent: true });
     const latestOrder = (updatedOrder || { ...existing, ...patchRecord }) as OrderRecord;
 
-    if (hasStatusChange && nextStatus !== existing.status) {
-      const orderMessage = 'Your order ' + String(existing.orderNumber) + ' is now ' + nextStatus + '.';
-      if (existing.customerUserId) {
-        await notifyUser(String(existing.customerUserId), 'Order status updated', orderMessage, 'order', '/?view=orders&orderId=' + encodeURIComponent(params.id));
-      }
-      const vendorIds = [...new Set((Array.isArray(existing.items) ? existing.items : []).map((item: OrderItem) => String(item.vendorId || '')).filter(Boolean))];
-      for (const vendorId of vendorIds) {
-        await notifyUser(vendorId, 'Order status updated', 'Order ' + String(existing.orderNumber) + ' is now ' + nextStatus + '.', 'order', '/');
-      }
-    }
-
     if ((b.courier !== undefined || b.trackingNumber !== undefined) && existing.customerUserId && (patchRecord.courier || patchRecord.trackingNumber)) {
       const trackDetails = [patchRecord.courier, patchRecord.trackingNumber].filter(Boolean).join(' · ');
       await notifyUser(String(existing.customerUserId), 'Shipping tracking updated', `Tracking for order ${String(existing.orderNumber)}: ${trackDetails}`, 'order', '/?view=orders&orderId=' + encodeURIComponent(params.id));
@@ -3545,29 +4065,7 @@ export const handler = router({
       }
     }
 
-    if (latestOrder.status === 'Completed' && latestOrder.paymentStatus === 'completed') {
-      await recordAffiliateCommissions(latestOrder);
-    }
-
-    const completedCustomerEmail = await resolveOrderCustomerEmail(latestOrder);
-    if (hasStatusChange && nextStatus === 'Completed' && completedCustomerEmail && !existing.customerCompletedEmailSentAt) {
-      const html = emailShell(
-        'YAKAJI DIGITAL HUB · ORDER COMPLETED',
-        `Your order ${String(existing.orderNumber || '')} is completed`,
-        'Thank you for shopping with Yakaji Digital Hub',
-        `<p>Hello <b>${htmlSafe(existing.customerName)}</b>,</p><p>Your Yakaji Digital Hub order <b>${htmlSafe(existing.orderNumber)}</b> (Total: <b>${money(existing.total)}</b>) has been marked as <b>Completed</b>.</p><p>Thank you for choosing Yakaji Digital Hub!</p>`
-      );
-      const sent = await sendEmail(completedCustomerEmail, `Your order ${existing.orderNumber} is completed`, html, {
-        role: 'customer',
-        orderId: existing.id,
-        orderNumber: String(existing.orderNumber || ''),
-        recipientName: String(existing.customerName || ''),
-        trigger: 'order_completed'
-      });
-      if (sent.sent) {
-        await db.tx.update('orders', [{ id: params.id, record: { customerCompletedEmailSentAt: new Date().toISOString() } }], { patch: true });
-      }
-    }
+    await applyOrderStatusEffects(existing, latestOrder, nextStatus);
 
     return json({ updated: true, order: latestOrder });
   }],

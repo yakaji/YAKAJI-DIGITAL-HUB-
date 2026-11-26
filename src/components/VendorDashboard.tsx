@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
-  BarChart3,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -20,10 +19,12 @@ import {
   Trash2,
   TrendingUp,
   UploadCloud,
+  Users,
   Wallet
 } from 'lucide-react';
+import { ShopAvatar, ShopCoverBanner } from './ShopDirectoryView';
 
-type VendorTab = 'overview' | 'products' | 'orders' | 'coupons' | 'payouts';
+type VendorTab = 'overview' | 'products' | 'orders' | 'coupons' | 'payouts' | 'shop';
 
 export type VendorUser = { userId: string; email?: string; name?: string; picture?: string };
 export type VendorAccount = {
@@ -32,9 +33,33 @@ export type VendorAccount = {
   ownerName: string;
   email: string;
   phone: string;
+  whatsapp?: string;
   description: string;
+  tagline?: string;
+  specialty?: string;
+  location?: string;
+  city?: string;
+  state?: string;
+  returnPolicy?: string;
+  iconPath?: string;
+  coverPath?: string;
+  iconUrl?: string;
+  coverUrl?: string;
+  followerCount?: number;
   status: string;
   createdAt: string;
+};
+export type VendorProfileFormState = {
+  shopName: string;
+  phone: string;
+  whatsapp: string;
+  tagline: string;
+  specialty: string;
+  location: string;
+  city: string;
+  state: string;
+  description: string;
+  returnPolicy: string;
 };
 export type VendorProduct = {
   id: string;
@@ -133,7 +158,14 @@ export function VendorDashboard({
   deleteVendorCoupon,
   orders,
   money,
-  openWallet
+  openWallet,
+  vendorProfileForm,
+  setVendorProfileForm,
+  saveVendorProfile,
+  uploadVendorShopMedia,
+  clearVendorShopMedia,
+  shopMediaBusy,
+  openPublicShop
 }: {
   user: VendorUser | null;
   vendor: VendorAccount | null;
@@ -183,6 +215,13 @@ export function VendorDashboard({
   orders: VendorOrder[];
   money: (n: number) => string;
   openWallet: () => Promise<void>;
+  vendorProfileForm: VendorProfileFormState;
+  setVendorProfileForm: React.Dispatch<React.SetStateAction<VendorProfileFormState>>;
+  saveVendorProfile: (e: FormEvent) => Promise<void>;
+  uploadVendorShopMedia: (kind: 'icon' | 'cover', file: File) => Promise<void>;
+  clearVendorShopMedia: (kind: 'icon' | 'cover') => Promise<void>;
+  shopMediaBusy: '' | 'icon' | 'cover' | 'profile';
+  openPublicShop: (shopId: string) => void;
 }) {
   const [activeTab, setActiveTab] = useState<VendorTab>('overview');
   const [productSearch, setProductSearch] = useState('');
@@ -382,15 +421,22 @@ export function VendorDashboard({
         <>
           <div className="seller-portal-header">
             <div className="workspace-heading">
-              <div>
-                <span className="eyebrow">SELLER CENTRE · {vendor.shopName.toUpperCase()}</span>
-                <h1>{vendor.shopName}</h1>
-                <p>
-                  Verified Storefront · {approvedProductCount} live listing{approvedProductCount === 1 ? '' : 's'} ·{' '}
-                  {activeOrdersCount} active order{activeOrdersCount === 1 ? '' : 's'}
-                </p>
+              <div className="seller-portal-identity">
+                <ShopAvatar shopName={vendor.shopName} iconUrl={vendor.iconUrl} size="md" />
+                <div>
+                  <span className="eyebrow">SELLER CENTRE · {vendor.shopName.toUpperCase()}</span>
+                  <h1>{vendor.shopName}</h1>
+                  <p>
+                    Verified Storefront · {approvedProductCount} live listing{approvedProductCount === 1 ? '' : 's'} ·{' '}
+                    {activeOrdersCount} active order{activeOrdersCount === 1 ? '' : 's'} ·{' '}
+                    {Number(vendor.followerCount || 0).toLocaleString()} follower{Number(vendor.followerCount || 0) === 1 ? '' : 's'}
+                  </p>
+                </div>
               </div>
               <div className="seller-header-actions">
+                <button type="button" className="secondary-btn" onClick={() => openPublicShop(vendor.id)}>
+                  <Store size={15} /> View storefront
+                </button>
                 <button type="button" className="secondary-btn" onClick={() => void refreshVendor()}>
                   <RefreshCw size={15} /> Refresh
                 </button>
@@ -407,6 +453,13 @@ export function VendorDashboard({
                 onClick={() => setActiveTab('overview')}
               >
                 <LayoutDashboard size={15} /> Overview
+              </button>
+              <button
+                type="button"
+                className={activeTab === 'shop' ? 'active' : ''}
+                onClick={() => setActiveTab('shop')}
+              >
+                <Store size={15} /> Shop Profile
               </button>
               <button
                 type="button"
@@ -453,6 +506,12 @@ export function VendorDashboard({
               <em>Gross sales: {money(wallet?.gross || 0)}</em>
             </article>
             <article className="admin-kpi">
+              <span><Users size={18} /></span>
+              <small>Shop followers</small>
+              <b>{Number(vendor.followerCount || 0).toLocaleString()}</b>
+              <em>Customers following your shop</em>
+            </article>
+            <article className="admin-kpi">
               <span><ShoppingBag size={18} /></span>
               <small>My catalog</small>
               <b>{myProducts.length.toLocaleString()}</b>
@@ -463,12 +522,6 @@ export function VendorDashboard({
               <small>Customer orders</small>
               <b>{orders.length.toLocaleString()}</b>
               <em>{activeOrdersCount} active · {orders.length - activeOrdersCount} closed</em>
-            </article>
-            <article className="admin-kpi">
-              <span><BarChart3 size={18} /></span>
-              <small>Spendable wallet funds</small>
-              <b>{money(wallet?.walletBalance || 0)}</b>
-              <em>Separate from sales payouts</em>
             </article>
           </section>
 
@@ -1309,6 +1362,206 @@ export function VendorDashboard({
                 )}
               </section>
             </div>
+          )}
+          {activeTab === 'shop' && (
+            <section className="panel shop-profile-editor-panel" id="vendor-shop-profile">
+              <div className="panel-title">
+                <div>
+                  <span className="eyebrow">STOREFRONT BRANDING &amp; IDENTITY</span>
+                  <h2>Edit shop profile, icon &amp; cover banner</h2>
+                  <p>Customize how customers see your storefront when browsing Vendor Shops and following your brand.</p>
+                </div>
+                <button type="button" className="secondary-btn" onClick={() => openPublicShop(vendor.id)}>
+                  <Store size={15} /> Preview public storefront
+                </button>
+              </div>
+
+              <div className="shop-media-editor-grid">
+                <div className="shop-media-card">
+                  <div className="shop-media-card-head">
+                    <div>
+                      <b>Shop cover picture</b>
+                      <small>Wide banner shown at the top of your shop storefront and directory card (JPG, PNG or WebP · up to 8MB)</small>
+                    </div>
+                  </div>
+                  <div className="shop-cover-preview-frame">
+                    <ShopCoverBanner shopName={vendorProfileForm.shopName || vendor.shopName} coverUrl={vendor.coverUrl} height="card" />
+                  </div>
+                  <div className="shop-media-card-actions">
+                    <label className="secondary-btn shop-upload-btn">
+                      <ImagePlus size={15} />
+                      <span>{shopMediaBusy === 'cover' ? 'Uploading cover...' : vendor.coverUrl ? 'Change cover image' : 'Upload cover image'}</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        disabled={Boolean(shopMediaBusy)}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = '';
+                          if (file) void uploadVendorShopMedia('cover', file);
+                        }}
+                      />
+                    </label>
+                    {vendor.coverUrl && (
+                      <button
+                        type="button"
+                        className="danger-icon"
+                        disabled={Boolean(shopMediaBusy)}
+                        onClick={() => void clearVendorShopMedia('cover')}
+                      >
+                        <Trash2 size={14} /> Remove cover
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="shop-media-card">
+                  <div className="shop-media-card-head">
+                    <div>
+                      <b>Shop icon / logo</b>
+                      <small>Square brand avatar displayed on your storefront, cards, and product pages (JPG, PNG or WebP · up to 8MB)</small>
+                    </div>
+                  </div>
+                  <div className="shop-icon-preview-row">
+                    <ShopAvatar shopName={vendorProfileForm.shopName || vendor.shopName} iconUrl={vendor.iconUrl} size="lg" />
+                    <div className="shop-media-card-actions">
+                      <label className="secondary-btn shop-upload-btn">
+                        <ImagePlus size={15} />
+                        <span>{shopMediaBusy === 'icon' ? 'Uploading icon...' : vendor.iconUrl ? 'Change shop icon' : 'Upload shop icon'}</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          disabled={Boolean(shopMediaBusy)}
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = '';
+                            if (file) void uploadVendorShopMedia('icon', file);
+                          }}
+                        />
+                      </label>
+                      {vendor.iconUrl && (
+                        <button
+                          type="button"
+                          className="danger-icon"
+                          disabled={Boolean(shopMediaBusy)}
+                          onClick={() => void clearVendorShopMedia('icon')}
+                        >
+                          <Trash2 size={14} /> Remove icon
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <form className="product-form" onSubmit={saveVendorProfile}>
+                <label>
+                  Shop / brand name
+                  <input
+                    required
+                    minLength={2}
+                    maxLength={100}
+                    value={vendorProfileForm.shopName}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, shopName: e.target.value }))}
+                    placeholder="e.g. Studio Yakaji Goods"
+                  />
+                </label>
+                <label>
+                  Short shop tagline
+                  <input
+                    maxLength={140}
+                    value={vendorProfileForm.tagline}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, tagline: e.target.value }))}
+                    placeholder="e.g. Curated design kits, courses & digital templates"
+                  />
+                </label>
+                <label>
+                  Primary specialty / category
+                  <select
+                    value={vendorProfileForm.specialty}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, specialty: e.target.value }))}
+                  >
+                    <option value="">General Marketplace</option>
+                    {categories.filter((c) => c !== 'All').map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Business phone
+                  <input
+                    required
+                    type="tel"
+                    maxLength={30}
+                    value={vendorProfileForm.phone}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, phone: e.target.value }))}
+                    placeholder="+234..."
+                  />
+                </label>
+                <label>
+                  WhatsApp number (optional)
+                  <input
+                    type="tel"
+                    maxLength={30}
+                    value={vendorProfileForm.whatsapp}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, whatsapp: e.target.value }))}
+                    placeholder="+234..."
+                  />
+                </label>
+                <label>
+                  City
+                  <input
+                    maxLength={80}
+                    value={vendorProfileForm.city}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, city: e.target.value }))}
+                    placeholder="e.g. Lagos, Abuja, Kano"
+                  />
+                </label>
+                <label>
+                  State
+                  <input
+                    maxLength={80}
+                    value={vendorProfileForm.state}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, state: e.target.value }))}
+                    placeholder="e.g. Lagos State, FCT"
+                  />
+                </label>
+                <label>
+                  Display location label (optional)
+                  <input
+                    maxLength={120}
+                    value={vendorProfileForm.location}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, location: e.target.value }))}
+                    placeholder="e.g. Ikeja, Lagos · Worldwide Digital Delivery"
+                  />
+                </label>
+                <label className="full-field">
+                  Shop bio &amp; what you sell
+                  <textarea
+                    required
+                    minLength={5}
+                    maxLength={1500}
+                    rows={3}
+                    value={vendorProfileForm.description}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, description: e.target.value }))}
+                    placeholder="Describe your brand, product focus, and customer promise..."
+                  />
+                </label>
+                <label className="full-field">
+                  Delivery &amp; return note (shown on storefront)
+                  <textarea
+                    maxLength={600}
+                    rows={2}
+                    value={vendorProfileForm.returnPolicy}
+                    onChange={(e) => setVendorProfileForm((curr) => ({ ...curr, returnPolicy: e.target.value }))}
+                    placeholder="e.g. Instant download delivery or 24-hour dispatch across Nigeria."
+                  />
+                </label>
+                <button className="primary-btn" disabled={shopMediaBusy === 'profile' || busy}>
+                  {shopMediaBusy === 'profile' ? 'Saving shop profile...' : 'Save shop profile'}
+                </button>
+              </form>
+            </section>
           )}
         </>
       )}

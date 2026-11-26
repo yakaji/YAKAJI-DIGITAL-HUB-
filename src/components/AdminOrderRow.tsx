@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
+  Eye,
   MapPin,
   Package,
   PackageCheck,
@@ -12,42 +14,15 @@ import {
   Truck,
   XCircle,
 } from 'lucide-react';
+import { formatOverdueNewDuration, isOrderOverdueNew } from '../utils/orderUrgency';
+import {
+  computeOrderFinancials,
+  type AdminOrderDetailRecord,
+  type AdminOrderLineItem,
+} from '../utils/adminOrderDetails';
 
-export type AdminOrderItem = {
-  productId: string;
-  name: string;
-  quantity: number;
-  price: number;
-  vendorId: string;
-  option: string;
-};
-
-export type AdminOrderRecord = {
-  id: string;
-  orderNumber: string;
-  customerName: string;
-  phone: string;
-  email: string;
-  address: string;
-  paymentMethod: string;
-  items: AdminOrderItem[];
-  total: number;
-  subtotal?: number;
-  transferFee?: number;
-  status: string;
-  paymentStatus?: string;
-  paymentNotificationSentAt?: string;
-  paymentCompletedAt?: string;
-  paystackReference?: string;
-  paymentReference?: string;
-  trackingNumber?: string;
-  courier?: string;
-  adminNote?: string;
-  refundStatus?: string;
-  refundedAt?: string;
-  updatedAt?: string;
-  createdAt: string;
-};
+export type AdminOrderItem = AdminOrderLineItem;
+export type AdminOrderRecord = AdminOrderDetailRecord;
 
 export type AdminOrderPatchPayload = {
   status?: string;
@@ -110,7 +85,11 @@ export function AdminOrderRow({
   onConfirmPayment,
   onReviewPayment,
   onResendEmails,
-  resendingEmail
+  onOpenDetails,
+  resendingEmail,
+  selectable = false,
+  selected = false,
+  onToggleSelect
 }: {
   order: AdminOrderRecord;
   mode: 'fulfilment' | 'payment' | 'history';
@@ -123,7 +102,11 @@ export function AdminOrderRow({
   onConfirmPayment: (id: string, manualPaystack?: boolean) => void;
   onReviewPayment: (id: string, decision: 'pending' | 'rejected') => void;
   onResendEmails?: (id: string) => void;
+  onOpenDetails?: (order: AdminOrderRecord) => void;
   resendingEmail?: boolean;
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (id: string) => void;
 }) {
   const [courier, setCourier] = useState(order.courier || '');
   const [trackingNumber, setTrackingNumber] = useState(order.trackingNumber || '');
@@ -138,6 +121,10 @@ export function AdminOrderRow({
   }, [order.courier, order.trackingNumber, order.adminNote]);
 
   const totalItems = order.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  const financials = computeOrderFinancials(order);
+  const account = order.customerAccount;
+  const overdueNew = isOrderOverdueNew(order);
+  const overdueLabel = overdueNew ? formatOverdueNewDuration(order.createdAt) : '';
   const paymentClass =
     order.paymentStatus === 'completed'
       ? 'approved'
@@ -146,7 +133,7 @@ export function AdminOrderRow({
         : 'pending';
   const orderStageClass = ['Completed'].includes(order.status)
     ? 'approved'
-    : ['Cancelled', 'Refunded', 'Returned'].includes(order.status)
+    : overdueNew || ['Cancelled', 'Refunded', 'Returned'].includes(order.status)
       ? 'rejected'
       : '';
   const canVerifyPayment =
@@ -178,13 +165,40 @@ export function AdminOrderRow({
   }
 
   return (
-    <article className={'compact-order-row' + (expanded ? ' is-expanded' : '')}>
+    <article
+      data-overdue-new={overdueNew ? 'true' : undefined}
+      className={
+        'compact-order-row' +
+        (expanded ? ' is-expanded' : '') +
+        (selectable && selected ? ' is-selected' : '') +
+        (overdueNew ? ' is-overdue-new' : '')
+      }
+    >
       <div className="compact-order-head">
+        {selectable && (
+          <label className="order-select-check" title={`Select order ${order.orderNumber}`}>
+            <input
+              type="checkbox"
+              checked={Boolean(selected)}
+              aria-label={`Select order ${order.orderNumber}`}
+              onChange={() => onToggleSelect?.(order.id)}
+            />
+          </label>
+        )}
         <div className="compact-order-primary">
           <div className="compact-order-id-line">
             <b className="tabular-nums">{order.orderNumber}</b>
             <span className={'status ' + orderStageClass}>{order.status}</span>
             <span className={'status ' + paymentClass}>{paymentStatusLabel(order.paymentStatus)}</span>
+            {overdueNew && (
+              <span
+                className="overdue-new-flag"
+                title="Order has remained in New status for longer than 24 hours"
+              >
+                <AlertTriangle size={12} aria-hidden="true" />
+                <span>{overdueLabel}</span>
+              </span>
+            )}
           </div>
           <small>
             {order.customerName || 'Customer'} · {totalItems} item{totalItems === 1 ? '' : 's'} ·{' '}
@@ -256,6 +270,16 @@ export function AdminOrderRow({
                 )}
               </div>
             )
+          )}
+
+          {onOpenDetails && (
+            <button
+              type="button"
+              className="secondary-btn compact-expand-btn"
+              onClick={() => onOpenDetails(order)}
+            >
+              <Eye size={14} /> Full details
+            </button>
           )}
 
           <button
@@ -397,7 +421,7 @@ export function AdminOrderRow({
           </div>
 
           <div className="order-history-items">
-            <b>Order items</b>
+            <b>Order items ({financials.itemCount})</b>
             {order.items.map((item, index) => (
               <div className="manage-row" key={item.productId + '-' + index}>
                 <div className="manage-main">
@@ -405,30 +429,71 @@ export function AdminOrderRow({
                     {item.name} × {item.quantity}
                   </b>
                   <small>
-                    {money(item.price)} each{item.option ? ' · ' + item.option : ''}
+                    {money(item.price)} each
+                    {item.option ? ' · ' + item.option : ''}
+                    {(item.vendorShopName || item.vendorId) ? ' · Shop: ' + (item.vendorShopName || item.vendorId) : ''}
+                    {item.productCategory ? ' · ' + item.productCategory : ''}
                   </small>
                 </div>
                 <b className="tabular-nums">{money(item.price * item.quantity)}</b>
               </div>
             ))}
+            <div className="admin-inline-ledger tabular-nums">
+              <span>Subtotal: <b>{money(financials.itemsSubtotal)}</b></span>
+              {financials.couponDiscount > 0 && (
+                <span>
+                  Coupon{financials.couponCode ? ` (${financials.couponCode})` : ''}:{' '}
+                  <b>−{money(financials.couponDiscount)}</b>
+                </span>
+              )}
+              {financials.transferFee > 0 && (
+                <span>Transfer fee: <b>{money(financials.transferFee)}</b></span>
+              )}
+              {financials.gatewayFee > 0 && (
+                <span>Gateway fee: <b>{money(financials.gatewayFee)}</b></span>
+              )}
+              <span>Order total: <b>{money(financials.total)}</b></span>
+            </div>
           </div>
 
           <div className="order-info-grid">
             <div>
-              <small>Customer</small>
-              <b>{order.customerName || 'Not provided'}</b>
+              <small>Order ID</small>
+              <b className="tabular-nums">{order.id}</b>
             </div>
             <div>
-              <small>Phone</small>
-              <b>{order.phone || 'Not provided'}</b>
+              <small>Customer</small>
+              <b>{order.customerName || account?.fullName || 'Not provided'}</b>
+            </div>
+            <div>
+              <small>Customer account</small>
+              <b>
+                {account && !account.isGuest
+                  ? `Registered (${account.userId}) · ${account.totalOrders ?? 1} order${(account.totalOrders ?? 1) === 1 ? '' : 's'}`
+                  : order.customerUserId
+                    ? `User ID: ${order.customerUserId}`
+                    : 'Guest checkout'}
+              </b>
+            </div>
+            <div>
+              <small>Phone{account?.whatsapp ? ' / WhatsApp' : ''}</small>
+              <b>
+                {[order.phone || account?.phone, account?.whatsapp ? `WA: ${account.whatsapp}` : '']
+                  .filter(Boolean)
+                  .join(' · ') || 'Not provided'}
+              </b>
             </div>
             <div>
               <small>Email</small>
-              <b>{order.email || 'Not provided'}</b>
+              <b>{order.email || account?.email || 'Not provided'}</b>
             </div>
             <div>
               <small>Delivery address</small>
-              <b>{order.address || 'Not provided'}</b>
+              <b>
+                {order.address ||
+                  [account?.address, account?.city, account?.state].filter(Boolean).join(', ') ||
+                  'Not provided'}
+              </b>
             </div>
             <div>
               <small>Courier &amp; tracking</small>
@@ -438,6 +503,30 @@ export function AdminOrderRow({
               <small>Placed at</small>
               <b>{new Date(order.createdAt).toLocaleString()}</b>
             </div>
+            <div>
+              <small>Last updated</small>
+              <b>{order.updatedAt ? new Date(order.updatedAt).toLocaleString() : 'No later updates'}</b>
+            </div>
+            {(order.affiliateReferralCode || order.affiliateId) && (
+              <div>
+                <small>Affiliate referral</small>
+                <b>{[order.affiliateName, order.affiliateReferralCode || order.affiliateId].filter(Boolean).join(' · ')}</b>
+              </div>
+            )}
+            {(order.cancelledAt || order.refundStatus) && (
+              <div>
+                <small>Cancellation / refund</small>
+                <b>
+                  {[
+                    order.refundStatus ? `Refund: ${order.refundStatus}` : '',
+                    order.refundedAt ? new Date(order.refundedAt).toLocaleString() : '',
+                    order.cancelledAt ? `Cancelled ${new Date(order.cancelledAt).toLocaleString()}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </b>
+              </div>
+            )}
           </div>
 
           <div className="order-tracking-editor">

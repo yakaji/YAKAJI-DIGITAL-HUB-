@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { pool, withDbRetry } from '../src/db/index.ts';
+import { pool, withDbRetry, withPoolClient } from '../src/db/index.ts';
 
 export type BackupType = 'daily_auto' | 'manual' | 'pre_migration';
 
@@ -117,24 +117,23 @@ export async function runDatabaseBackup(backupType: BackupType = 'manual'): Prom
     const tableCounts: Record<string, number> = {};
     let recordCount = 0;
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      for (const table of SNAPSHOT_TABLES) {
-        const res = await client.query<Record<string, unknown>>(
-          `SELECT * FROM ${table} ORDER BY id ASC`
-        );
-        snapshot[table] = res.rows;
-        tableCounts[table] = res.rows.length;
-        recordCount += res.rows.length;
+    await withPoolClient(async (client) => {
+      try {
+        await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+        for (const table of SNAPSHOT_TABLES) {
+          const res = await client.query<Record<string, unknown>>(
+            `SELECT * FROM ${table} ORDER BY id ASC`
+          );
+          snapshot[table] = res.rows;
+          tableCounts[table] = res.rows.length;
+          recordCount += res.rows.length;
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
       }
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
 
     const checksumSha256 = computeChecksum(snapshot);
     const createdAt = new Date().toISOString();
@@ -292,42 +291,41 @@ export async function restoreFromBackupSafe(backupId: string): Promise<{
     const restoredCounts: Record<string, number> = {};
     let totalRestored = 0;
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    await withPoolClient(async (client) => {
+      try {
+        await client.query('BEGIN');
 
-      for (const table of SNAPSHOT_TABLES) {
-        const rows = Array.isArray(snapshot[table]) ? snapshot[table] : [];
-        let inserted = 0;
-        for (const row of rows) {
-          const cols = Object.keys(row);
-          if (cols.length === 0) continue;
-          const colSql = cols.map((c) => `"${c.replace(/"/g, '')}"`).join(', ');
-          const valPlaceholders = cols.map((_, idx) => `$${idx + 1}`).join(', ');
-          const values = cols.map((c) => {
-            const val = row[c];
-            if (val !== null && typeof val === 'object') {
-              return JSON.stringify(val);
-            }
-            return val;
-          });
-          const r = await client.query(
-            `INSERT INTO ${table} (${colSql}) VALUES (${valPlaceholders}) ON CONFLICT DO NOTHING`,
-            values
-          );
-          if ((r.rowCount || 0) > 0) inserted += 1;
+        for (const table of SNAPSHOT_TABLES) {
+          const rows = Array.isArray(snapshot[table]) ? snapshot[table] : [];
+          let inserted = 0;
+          for (const row of rows) {
+            const cols = Object.keys(row);
+            if (cols.length === 0) continue;
+            const colSql = cols.map((c) => `"${c.replace(/"/g, '')}"`).join(', ');
+            const valPlaceholders = cols.map((_, idx) => `$${idx + 1}`).join(', ');
+            const values = cols.map((c) => {
+              const val = row[c];
+              if (val !== null && typeof val === 'object') {
+                return JSON.stringify(val);
+              }
+              return val;
+            });
+            const r = await client.query(
+              `INSERT INTO ${table} (${colSql}) VALUES (${valPlaceholders}) ON CONFLICT DO NOTHING`,
+              values
+            );
+            if ((r.rowCount || 0) > 0) inserted += 1;
+          }
+          restoredCounts[table] = inserted;
+          totalRestored += inserted;
         }
-        restoredCounts[table] = inserted;
-        totalRestored += inserted;
-      }
 
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      client.release();
-    }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
+    });
 
     return { restoredCounts, totalRestored };
   });

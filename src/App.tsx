@@ -14,12 +14,25 @@ import {
   CategoryHighlightIcon
 } from './data/categoryShowcase';
 import { AdminProfitCalendar } from './components/AdminProfitCalendar';
-import { AdminOrderRow, isFulfilledOrderStatus, type AdminOrderPatchPayload } from './components/AdminOrderRow';
-import { VendorDashboard } from './components/VendorDashboard';
-import { AffiliateDashboard } from './components/AffiliateDashboard';
+import { AdminOrderRow, isFulfilledOrderStatus, type AdminOrderPatchPayload, type AdminOrderRecord } from './components/AdminOrderRow';
+import { AdminOrderDetailsModal } from './components/AdminOrderDetailsModal';
 import {
-  ArrowLeft, ArrowRight, Award, BarChart3, Bell, Briefcase, Calendar, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
-  Code2, Copy, Download, Droplets, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
+  BULK_ORDER_STATUSES,
+  areAllVisibleOrdersSelected,
+  areSomeVisibleOrdersSelected,
+  getSelectedVisibleOrderIds,
+  pruneSelectedOrderIds,
+  toggleOrderSelection,
+  toggleSelectAllVisibleOrders,
+} from './utils/bulkOrderActions';
+import { VendorDashboard, type VendorAccount, type VendorProfileFormState } from './components/VendorDashboard';
+import { AffiliateDashboard } from './components/AffiliateDashboard';
+import { OrderHistoryChart } from './components/OrderHistoryChart';
+import { ShopAvatar, ShopDirectoryPage, ShopStorefrontPage } from './components/ShopDirectoryView';
+import type { PublicShop } from './utils/shopDirectory';
+import {
+  ArrowLeft, ArrowRight, Award, BarChart3, Bell, Briefcase, Calendar, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
+  Code2, Copy, Download, Droplets, Eye, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
   Lock, LogIn, LogOut, Megaphone, Menu, MessageCircle, MessageSquare, Package,
   PlayCircle, Plus, Search, Share2, ShieldCheck, Shirt, ShoppingBag, Star, Store, Tag,
   Trash2, TrendingUp, Truck, UploadCloud, UserRound, Users, Utensils, Wallet, X, Zap
@@ -34,13 +47,9 @@ type Product = {
   standardPrice?: number; discountPrice?: number; discountPercent?: number; discountActive?: boolean; discountStartAt?: string; discountEndAt?: string;
   averageRating?: number; reviewCount?: number;
 };
-type Vendor = { id: string; shopName: string; ownerName: string; email: string; phone: string; description: string; status: string; createdAt: string };
+type Vendor = VendorAccount;
 type MarketSettings = {customerTransferFee:number;withdrawalFee:number;walletFundingFee:number;commissionPercent:number;cashbackPercent:number};
-type Order = {
-  id: string; orderNumber: string; customerName: string; phone: string; email: string;
-  address: string; paymentMethod: string; items: Array<{ productId: string; name: string; quantity: number; price: number; vendorId: string; option: string }>;
-  total: number; subtotal?: number; transferFee?: number; status: string; paymentStatus?: string; paymentNotificationSentAt?: string; paymentCompletedAt?: string; paystackReference?: string; paymentReference?: string; trackingNumber?: string; courier?: string; adminNote?: string; refundStatus?: string; refundedAt?: string; updatedAt?: string; createdAt: string;
-};
+type Order = AdminOrderRecord;
 type ProductDraft = {
   id?: string; name: string; category: string; price: string; description: string;
   stock: string; tag: string; options: string; images: string[]; videos: string[]; affiliateCommissionPercent: string; marketplaceCommissionPercent: string;
@@ -186,12 +195,38 @@ function App() {
   const [detailQuantity,setDetailQuantity]=useState(1);
   const [analyticsPeriod, setAnalyticsPeriod] = useState<'day' | 'week' | 'month' | 'year'>('day');
   const [vendor, setVendor] = useState<Vendor | null>(null);
-  const [page, setPage] = useState<'home' | 'catalog' | 'category' | 'vendor' | 'admin' | 'admin-history' | 'profile' | 'wallet' | 'support' | 'orders' | 'affiliate'>('home');
+  const [shops, setShops] = useState<PublicShop[]>([]);
+  const [shopsLoading, setShopsLoading] = useState(false);
+  const [followedShopIds, setFollowedShopIds] = useState<string[]>([]);
+  const [followBusyId, setFollowBusyId] = useState('');
+  const [shopsInitialMode, setShopsInitialMode] = useState<'all' | 'following'>('all');
+  const [activeShopId, setActiveShopId] = useState('');
+  const [activeShopDetail, setActiveShopDetail] = useState<PublicShop | null>(null);
+  const [activeShopProducts, setActiveShopProducts] = useState<Product[]>([]);
+  const [activeShopLoading, setActiveShopLoading] = useState(false);
+  const [shopMediaBusy, setShopMediaBusy] = useState<'' | 'icon' | 'cover' | 'profile'>('');
+  const [vendorProfileForm, setVendorProfileForm] = useState<VendorProfileFormState>({
+    shopName: '',
+    phone: '',
+    whatsapp: '',
+    tagline: '',
+    specialty: '',
+    location: '',
+    city: '',
+    state: '',
+    description: '',
+    returnPolicy: '',
+  });
+  const [page, setPage] = useState<'home' | 'catalog' | 'category' | 'shops' | 'shop' | 'vendor' | 'admin' | 'admin-history' | 'profile' | 'wallet' | 'support' | 'orders' | 'affiliate'>('home');
   const [adminSupportCollapsed, setAdminSupportCollapsed] = useState(false);
   const [adminSupportFilter, setAdminSupportFilter] = useState<'all' | 'waiting' | 'human' | 'active' | 'closed'>('all');
   const supportAdminMessagesRef = useRef<HTMLDivElement | null>(null);
   const [adminOrderSearch, setAdminOrderSearch] = useState('');
   const [adminOrderFilter, setAdminOrderFilter] = useState<'all' | 'New' | 'processing' | 'delivery' | 'unpaid'>('all');
+  const [selectedOrderIds, setSelectedOrderIds] = useState<string[]>([]);
+  const [bulkOrderStatus, setBulkOrderStatus] = useState<string>('Ready for Shipping');
+  const [bulkOrderBusy, setBulkOrderBusy] = useState(false);
+  const selectAllOrdersCheckboxRef = useRef<HTMLInputElement | null>(null);
   const [expandedOrderIds, setExpandedOrderIds] = useState<Record<string, boolean>>({});
   const [expandedPaymentIds, setExpandedPaymentIds] = useState<Record<string, boolean>>({});
   const [showPaidInPayments, setShowPaidInPayments] = useState(false);
@@ -200,6 +235,8 @@ function App() {
   const [adminHistoryFrom, setAdminHistoryFrom] = useState('');
   const [adminHistoryTo, setAdminHistoryTo] = useState('');
   const [expandedHistoryIds, setExpandedHistoryIds] = useState<Record<string, boolean>>({});
+  const [detailOrderId, setDetailOrderId] = useState('');
+  const [detailOrderFallback, setDetailOrderFallback] = useState<Order | null>(null);
   const [emailStatus, setEmailStatus] = useState<{ configured?: boolean; hasApiKey?: boolean; hasFromAddress?: boolean; fromAddress?: string; adminRecipient?: string; logs?: any[] } | null>(null);
   const [resendingOrderId, setResendingOrderId] = useState<string | null>(null);
   const [adminSecurity, setAdminSecurity] = useState<{ ownerEmail?: string; hasEnvOverride?: boolean; hasSavedHash?: boolean; lastLoginAt?: string | null } | null>(null);
@@ -318,6 +355,132 @@ function App() {
     if (window.location.pathname !== targetPath) pushCleanPath(targetPath);
     window.scrollTo({ top: 0, behavior: 'auto' });
   }
+  function syncVendorProfileForm(nextVendor: Vendor | null) {
+    if (!nextVendor) {
+      setVendorProfileForm({
+        shopName: '',
+        phone: '',
+        whatsapp: '',
+        tagline: '',
+        specialty: '',
+        location: '',
+        city: '',
+        state: '',
+        description: '',
+        returnPolicy: '',
+      });
+      return;
+    }
+    setVendorProfileForm({
+      shopName: nextVendor.shopName || '',
+      phone: nextVendor.phone || '',
+      whatsapp: nextVendor.whatsapp || '',
+      tagline: nextVendor.tagline || '',
+      specialty: nextVendor.specialty || '',
+      location: nextVendor.location || '',
+      city: nextVendor.city || '',
+      state: nextVendor.state || '',
+      description: nextVendor.description || '',
+      returnPolicy: nextVendor.returnPolicy || '',
+    });
+  }
+  async function loadShops() {
+    setShopsLoading(true);
+    try {
+      const r = await api.get('/api/shops');
+      const nextShops = Array.isArray(r.data?.shops) ? (r.data.shops as PublicShop[]) : [];
+      const nextFollowed = Array.isArray(r.data?.followedShopIds)
+        ? (r.data.followedShopIds as string[])
+        : nextShops.filter(s => s.isFollowed).map(s => s.id);
+      setShops(nextShops);
+      setFollowedShopIds(nextFollowed);
+    } catch {
+      /* public directory fallback */
+    } finally {
+      setShopsLoading(false);
+    }
+  }
+  async function loadShopDetail(shopId: string) {
+    if (!shopId) return;
+    setActiveShopLoading(true);
+    try {
+      const r = await api.get('/api/shops/' + encodeURIComponent(shopId));
+      setActiveShopDetail((r.data?.shop as PublicShop) || null);
+      setActiveShopProducts(Array.isArray(r.data?.products) ? (r.data.products as Product[]) : []);
+    } catch (e) {
+      setActiveShopDetail(null);
+      setActiveShopProducts([]);
+      setError(errorText(e));
+    } finally {
+      setActiveShopLoading(false);
+    }
+  }
+  function navigateShops(mode: 'all' | 'following' = 'all') {
+    setShopsInitialMode(mode);
+    setPage('shops');
+    setMobileMenuOpen(false);
+    if (window.location.pathname !== '/shops') pushCleanPath('/shops');
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    void loadShops();
+  }
+  function openPublicShop(shopId: string) {
+    if (!shopId) return;
+    const fromCache = shops.find(s => s.id === shopId) || null;
+    setActiveShopId(shopId);
+    setActiveShopDetail(fromCache);
+    setSelectedProduct(null);
+    setPage('shop');
+    setMobileMenuOpen(false);
+    const targetPath = '/shop/' + encodeURIComponent(shopId);
+    if (window.location.pathname !== targetPath) pushCleanPath(targetPath);
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    void loadShopDetail(shopId);
+  }
+  async function toggleFollowShop(shop: PublicShop) {
+    if (!user) {
+      flash('Please sign in to follow your favorite vendor shops.');
+      await signIn('login');
+      return;
+    }
+    const currentlyFollowed = followedShopIds.includes(shop.id) || shop.isFollowed;
+    setFollowBusyId(shop.id);
+    setError('');
+    try {
+      const r = currentlyFollowed
+        ? await api.delete('/api/shops/' + encodeURIComponent(shop.id) + '/follow')
+        : await api.post('/api/shops/' + encodeURIComponent(shop.id) + '/follow', {});
+      const followed = Boolean(r.data?.followed);
+      const followerCount = Number(r.data?.followerCount ?? (followed ? shop.followerCount + 1 : Math.max(0, shop.followerCount - 1)));
+      setFollowedShopIds(current => {
+        if (followed) return current.includes(shop.id) ? current : [...current, shop.id];
+        return current.filter(id => id !== shop.id);
+      });
+      setShops(current =>
+        current.map(item =>
+          item.id === shop.id ? { ...item, isFollowed: followed, followerCount } : item
+        )
+      );
+      setActiveShopDetail(current =>
+        current && current.id === shop.id ? { ...current, isFollowed: followed, followerCount } : current
+      );
+      flash(followed ? `You are now following ${shop.shopName}.` : `Unfollowed ${shop.shopName}.`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setFollowBusyId('');
+    }
+  }
+  function copyShopLink(shop: PublicShop) {
+    const link = `${window.location.origin}/shop/${encodeURIComponent(shop.id)}`;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(link).then(
+        () => flash('Storefront link copied!'),
+        () => window.prompt('Copy this storefront link:', link)
+      );
+    } else {
+      window.prompt('Copy this storefront link:', link);
+    }
+  }
   function flash(message: string) { setNotice(message); window.setTimeout(() => setNotice(''), 4000); }
   async function loadNotifications() {
     if (!user) return;
@@ -426,13 +589,14 @@ function App() {
     finally { setCustomerOrdersLoading(false); }
   }
   async function loadVendor(): Promise<Vendor | null> {
-    if (!user) { setVendor(null); return null; }
+    if (!user) { setVendor(null); syncVendorProfileForm(null); return null; }
     try {
       const r = await api.get('/api/vendor/me');
-      const current = r.data.vendor || null;
+      const current = (r.data.vendor || null) as Vendor | null;
       setVendor(current);
+      syncVendorProfileForm(current);
       return current;
-    } catch { setVendor(null); return null; }
+    } catch { setVendor(null); syncVendorProfileForm(null); return null; }
   }
   async function loadVendorWorkspace() {
     const [p, o, c, walletResult] = await Promise.all([
@@ -475,10 +639,21 @@ function App() {
         const restored = await auth.getUser();
         if (!active) return;
         setUser(restored);
-        const [r,s] = await Promise.all([api.get('/api/products'),api.get('/api/settings/public')]);
+        const [r, s, sh] = await Promise.all([
+          api.get('/api/products'),
+          api.get('/api/settings/public'),
+          api.get('/api/shops').catch(() => ({ data: { shops: [], followedShopIds: [] } })),
+        ]);
         if (active) {
           setProducts(r.data?.products || []);
           setSettings(current => normalizeMarketSettings(s.data?.settings, current));
+          const loadedShops = Array.isArray(sh.data?.shops) ? (sh.data.shops as PublicShop[]) : [];
+          setShops(loadedShops);
+          setFollowedShopIds(
+            Array.isArray(sh.data?.followedShopIds)
+              ? (sh.data.followedShopIds as string[])
+              : loadedShops.filter(item => item.isFollowed).map(item => item.id)
+          );
         }
         if (restored) {
           try {
@@ -497,7 +672,11 @@ function App() {
           } catch { /* profile can be completed later */ }
           try {
             const v = await api.get('/api/vendor/me');
-            if (active) setVendor(v.data.vendor || null);
+            if (active) {
+              const restoredVendor = (v.data.vendor || null) as Vendor | null;
+              setVendor(restoredVendor);
+              syncVendorProfileForm(restoredVendor);
+            }
           } catch { /* vendor profile is optional */ }
         }
       } catch (e) { if (active) setError(errorText(e)); }
@@ -755,6 +934,21 @@ function App() {
         setPage('admin');
         return;
       }
+      if (path === '/shops') {
+        setPage('shops');
+        void loadShops();
+        return;
+      }
+      if (path.startsWith('/shop/')) {
+        let shopId = '';
+        try { shopId = decodeURIComponent(path.slice('/shop/'.length)); } catch { shopId = path.slice('/shop/'.length); }
+        if (shopId) {
+          setActiveShopId(shopId);
+          setPage('shop');
+          void loadShopDetail(shopId);
+          return;
+        }
+      }
       if (path === '/catalog') {
         setCategory('All');
         setPage('catalog');
@@ -771,7 +965,7 @@ function App() {
       }
       if (path === '/') {
         setCategory('All');
-        setPage(current => (current === 'catalog' || current === 'category' || current === 'admin' || current === 'admin-history' ? 'home' : current));
+        setPage(current => (['catalog', 'category', 'shops', 'shop', 'admin', 'admin-history'].includes(current) ? 'home' : current));
       }
     };
     applyPath();
@@ -822,6 +1016,33 @@ function App() {
       );
     });
   }, [sortedAdminOrders, adminOrderSearch, adminOrderFilter]);
+
+  const selectedVisibleOrderIds = useMemo(
+    () => getSelectedVisibleOrderIds(selectedOrderIds, activeAdminOrders),
+    [selectedOrderIds, activeAdminOrders]
+  );
+  const allVisibleOrdersSelected = useMemo(
+    () => areAllVisibleOrdersSelected(selectedOrderIds, activeAdminOrders),
+    [selectedOrderIds, activeAdminOrders]
+  );
+  const someVisibleOrdersSelected = useMemo(
+    () => areSomeVisibleOrdersSelected(selectedOrderIds, activeAdminOrders),
+    [selectedOrderIds, activeAdminOrders]
+  );
+
+  useEffect(() => {
+    if (selectAllOrdersCheckboxRef.current) {
+      selectAllOrdersCheckboxRef.current.indeterminate = someVisibleOrdersSelected;
+    }
+  }, [someVisibleOrdersSelected]);
+
+  useEffect(() => {
+    const activePool = sortedAdminOrders.filter(o => !isFulfilledOrderStatus(o.status));
+    setSelectedOrderIds(current => {
+      const pruned = pruneSelectedOrderIds(current, activePool);
+      return pruned.length === current.length ? current : pruned;
+    });
+  }, [sortedAdminOrders]);
 
   const paymentQueueOrders = useMemo(() => {
     if (showPaidInPayments) return sortedAdminOrders.filter(o => !isFulfilledOrderStatus(o.status));
@@ -966,7 +1187,10 @@ function App() {
         email: savedProfile?.email || signedUser.email || current.email,
         address: savedProfile?.address || current.address
       }));
-      setVendor(vr?.data?.vendor || null);
+      const nextVendor = (vr?.data?.vendor || null) as Vendor | null;
+      setVendor(nextVendor);
+      syncVendorProfileForm(nextVendor);
+      void loadShops();
     } catch { /* profile or vendor optional */ }
   }
 
@@ -1011,6 +1235,9 @@ function App() {
     setUser(null);
     setProfile(null);
     setVendor(null);
+    syncVendorProfileForm(null);
+    setFollowedShopIds([]);
+    setShops(current => current.map(s => ({ ...s, isFollowed: false })));
     setWalletSummary(null);
     setAdminUsers([]);
     setAdminAnalytics(null);
@@ -1428,9 +1655,83 @@ function App() {
     e.preventDefault(); setBusy(true); setError('');
     try {
       const r = await api.post('/api/vendor/apply', shopForm);
-      setVendor(r.data.vendor); flash('Vendor application submitted. Your shop will open after approval.');
+      const saved = (r.data.vendor || null) as Vendor | null;
+      setVendor(saved);
+      syncVendorProfileForm(saved);
+      flash('Vendor application submitted. Your shop will open after approval.');
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
+  }
+  async function saveVendorProfile(e: FormEvent) {
+    e.preventDefault();
+    setShopMediaBusy('profile');
+    setError('');
+    try {
+      const r = await api.put('/api/vendor/profile', vendorProfileForm);
+      const updated = (r.data?.vendor || null) as Vendor | null;
+      if (updated) {
+        setVendor(updated);
+        syncVendorProfileForm(updated);
+      }
+      await Promise.all([loadProducts(), loadShops()]);
+      flash(r.data?.message || 'Shop profile updated successfully.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setShopMediaBusy('');
+    }
+  }
+  async function uploadVendorShopMedia(kind: 'icon' | 'cover', file: File) {
+    if (!file.type.startsWith('image/')) {
+      setError('Choose a valid image file (PNG, JPG or WebP).');
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setError('Shop images must be 8MB or smaller.');
+      return;
+    }
+    setShopMediaBusy(kind);
+    setError('');
+    try {
+      const base64 = await fileToBase64(file);
+      const r = await api.post('/api/vendor/shop-media', {
+        kind,
+        fileName: file.name,
+        contentType: file.type,
+        base64,
+      });
+      const updated = (r.data?.vendor || null) as Vendor | null;
+      if (updated) {
+        setVendor(updated);
+        syncVendorProfileForm(updated);
+      }
+      await loadShops();
+      flash(r.data?.message || (kind === 'icon' ? 'Shop icon updated.' : 'Shop cover banner updated.'));
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setShopMediaBusy('');
+    }
+  }
+  async function clearVendorShopMedia(kind: 'icon' | 'cover') {
+    setShopMediaBusy(kind);
+    setError('');
+    try {
+      const r = await api.put('/api/vendor/profile', {
+        [kind === 'icon' ? 'iconPath' : 'coverPath']: '',
+      });
+      const updated = (r.data?.vendor || null) as Vendor | null;
+      if (updated) {
+        setVendor(updated);
+        syncVendorProfileForm(updated);
+      }
+      await loadShops();
+      flash(kind === 'icon' ? 'Shop icon removed.' : 'Shop cover image removed.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setShopMediaBusy('');
+    }
   }
   function startNewProduct() { setDraft(blankDraft); setSelectedFiles([]); setEditing(false); }
   function startEdit(p: Product) {
@@ -1710,6 +2011,43 @@ function App() {
       flash(patch.status ? 'Order updated to ' + patch.status + '.' : 'Order details saved.');
     } catch (e) { setError(errorText(e)); }
   }
+  function openAdminOrderDetails(order: Order) {
+    setDetailOrderFallback(order);
+    setDetailOrderId(order.id);
+  }
+  const activeDetailOrder = useMemo(() => {
+    if (!detailOrderId) return null;
+    const fromOrders = orders.find(o => o.id === detailOrderId);
+    if (fromOrders) return fromOrders;
+    for (const u of adminUsers) {
+      const list = Array.isArray(u.orders) ? u.orders : Array.isArray(u.recentOrders) ? u.recentOrders : [];
+      const found = list.find((o: Order) => o.id === detailOrderId);
+      if (found) return found as Order;
+    }
+    return detailOrderFallback;
+  }, [detailOrderId, orders, adminUsers, detailOrderFallback]);
+  async function applyBulkOrderStatus() {
+    if (!selectedVisibleOrderIds.length) {
+      setError('Select at least one active order first.');
+      return;
+    }
+    setBulkOrderBusy(true);
+    setError('');
+    try {
+      const targetIds = [...selectedVisibleOrderIds];
+      const r = await api.put('/api/admin/orders/bulk-status', {
+        orderIds: targetIds,
+        status: bulkOrderStatus,
+      });
+      setSelectedOrderIds(current => current.filter(id => !targetIds.includes(id)));
+      await loadAdmin();
+      flash(r.data?.message || `Updated ${targetIds.length} order(s) to ${bulkOrderStatus}.`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBulkOrderBusy(false);
+    }
+  }
   function exportActiveOrdersCsv() {
     if (!activeAdminOrders.length) {
       setError('There are no active orders matching the current filter to export.');
@@ -1821,7 +2159,20 @@ function App() {
         <div className="product-meta-line">
           <span className="product-meta-cat">{p.category}</span>
           <span aria-hidden="true">·</span>
-          <span>{p.vendorName || 'Yakaji Hub'}</span>
+          {shops.some(s => s.id === p.vendorId) ? (
+            <button
+              type="button"
+              className="product-shop-link"
+              onClick={(e) => {
+                e.stopPropagation();
+                openPublicShop(p.vendorId);
+              }}
+            >
+              {p.vendorName || 'Yakaji Hub'}
+            </button>
+          ) : (
+            <span>{p.vendorName || 'Yakaji Hub'}</span>
+          )}
         </div>
         <h3>{p.name}</h3>
         {rating > 0 && <small className="product-rating-line"><Star size={13} fill="currentColor"/> {rating.toFixed(1)} <span>({reviewsTotal})</span></small>}
@@ -1926,6 +2277,8 @@ function App() {
         <div className="market-nav-links">
           <button className={page === 'home' ? 'nav-active' : ''} onClick={navigateHome}>Home</button>
           <button className={page === 'catalog' ? 'nav-active' : ''} onClick={() => navigateCatalog()}>All Products</button>
+          <button className={(page === 'shops' && shopsInitialMode === 'all') || page === 'shop' ? 'nav-active' : ''} onClick={() => navigateShops('all')}>Vendor Shops</button>
+          <button className={page === 'shops' && shopsInitialMode === 'following' ? 'nav-active' : ''} onClick={() => navigateShops('following')}>Following{followedShopIds.length ? ` (${followedShopIds.length})` : ''}</button>
           <button className={page === 'category' && activeCategorySlug === 'digital-products' ? 'nav-active' : ''} onClick={() => navigateCategory('Digital Products')}>Digital Products</button>
           <button className={page === 'category' && activeCategorySlug === 'digital-courses' ? 'nav-active' : ''} onClick={() => navigateCategory('Digital Courses')}>Courses</button>
           <button className={page === 'category' && activeCategorySlug === 'digital-services' ? 'nav-active' : ''} onClick={() => navigateCategory('Digital Services')}>Services</button>
@@ -1960,6 +2313,7 @@ function App() {
             <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); void openChatInbox(); }}><span><MessageSquare size={17}/> Messages</span><ChevronRight size={16}/></button>
             <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); void openNotifications(); }}><span><Bell size={17}/> Notifications</span>{unreadNotifications > 0 && <span className="header-count-badge alert">{unreadNotifications}</span>}</button>
           </>}
+          <button className="mobile-drawer-item" onClick={() => navigateShops('following')}><span><Store size={17}/> Favorite Shops</span><b>{followedShopIds.length}</b></button>
           <button className="mobile-drawer-item" onClick={() => navigateCatalog({ favoritesOnly: true })}><span><Heart size={17}/> Saved Wishlist</span><b>{favorites.length}</b></button>
           <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); setCheckoutOpen(true); }}><span><ShoppingBag size={17}/> Shopping Cart</span><b>{cartCount}</b></button>
         </div>
@@ -1967,6 +2321,7 @@ function App() {
         <div className="mobile-drawer-group">
           <span className="mobile-drawer-label">Marketplace Portals</span>
           <button className="mobile-drawer-item" onClick={navigateHome}><span><Store size={17}/> Marketplace Home</span><ChevronRight size={16}/></button>
+          <button className="mobile-drawer-item" onClick={() => navigateShops('all')}><span><Store size={17}/> Vendor Shops</span><ChevronRight size={16}/></button>
           <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); void openVendor(); }}><span><Store size={17}/> Vendor Dashboard</span><ChevronRight size={16}/></button>
           <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); void openAffiliate(); }}><span><TrendingUp size={17}/> Affiliate Program</span><ChevronRight size={16}/></button>
           <button className="mobile-drawer-item" onClick={() => { setMobileMenuOpen(false); setPage('support'); }}><span><Headphones size={17}/> Help &amp; Live Support</span><ChevronRight size={16}/></button>
@@ -2130,6 +2485,60 @@ function App() {
           </div>
         </> : <div className="empty-box"><Package size={36}/><h3>No products match your search</h3><p>Clear your search query or explore our complete catalog page.</p><button className="secondary-btn" onClick={() => { setSearch(''); navigateCatalog(); }}>Browse Complete Catalog</button></div>}
       </section>
+
+      {shops.length > 0 && (
+        <section className="market-section" aria-label="Featured vendor shops">
+          <div className="section-head">
+            <div>
+              <span className="eyebrow">INDEPENDENT STOREFRONTS</span>
+              <h2>{followedShopIds.length ? 'Shops You Follow & Verified Sellers' : 'Verified Vendor Shops'}</h2>
+              <p>Follow your favorite independent sellers to save their storefronts and browse their latest releases.</p>
+            </div>
+            <div className="home-shops-cta-group">
+              {followedShopIds.length > 0 && (
+                <button type="button" className="secondary-btn" onClick={() => navigateShops('following')}>
+                  <Heart size={14} fill="currentColor" /> Following ({followedShopIds.length})
+                </button>
+              )}
+              <button type="button" className="view-all-link" onClick={() => navigateShops('all')}>
+                Explore All Shops <ArrowRight size={15}/>
+              </button>
+            </div>
+          </div>
+          <div className="home-shop-strip">
+            {shops.slice(0, 4).map(shop => {
+              const isFollowed = followedShopIds.includes(shop.id) || shop.isFollowed;
+              return (
+                <article className="home-shop-card" key={shop.id}>
+                  <div className="home-shop-card-top" onClick={() => openPublicShop(shop.id)} role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter') openPublicShop(shop.id); }}>
+                    <ShopAvatar shopName={shop.shopName} iconUrl={shop.iconUrl} size="sm" />
+                    <div className="home-shop-card-copy">
+                      <b>{shop.shopName}</b>
+                      <small className="tabular-nums">
+                        {shop.productCount} item{shop.productCount === 1 ? '' : 's'} · {shop.followerCount} follower{shop.followerCount === 1 ? '' : 's'}
+                      </small>
+                    </div>
+                  </div>
+                  <div className="home-shop-card-actions">
+                    <button
+                      type="button"
+                      className={isFollowed ? 'follow-shop-btn is-following sm' : 'follow-shop-btn sm'}
+                      disabled={followBusyId === shop.id}
+                      onClick={() => void toggleFollowShop(shop)}
+                    >
+                      {isFollowed ? <Check size={13} /> : <Heart size={13} />}
+                      <span>{isFollowed ? 'Following' : 'Follow'}</span>
+                    </button>
+                    <button type="button" className="secondary-btn" onClick={() => openPublicShop(shop.id)}>
+                      Visit
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <section className="partner-grid" aria-label="Sell and earn with Yakaji">
         <article className="vendor-callout">
@@ -2400,6 +2809,43 @@ function App() {
       </form>}
     </main>}
 
+    {page === 'shops' && (
+      <ShopDirectoryPage
+        key={shopsInitialMode}
+        shops={shops}
+        followedShopIds={followedShopIds}
+        products={approvedProducts}
+        loading={shopsLoading}
+        userSignedIn={Boolean(user)}
+        onSignIn={async () => { await signIn('login'); }}
+        onNavigateHome={navigateHome}
+        onOpenShop={openPublicShop}
+        onToggleFollow={toggleFollowShop}
+        followBusyId={followBusyId}
+        renderProductCard={renderProductCard}
+        initialMode={shopsInitialMode}
+      />
+    )}
+
+    {page === 'shop' && (
+      <ShopStorefrontPage
+        shop={activeShopDetail || shops.find(s => s.id === activeShopId) || null}
+        shopProducts={
+          activeShopProducts.length
+            ? activeShopProducts
+            : approvedProducts.filter(p => p.vendorId === activeShopId)
+        }
+        loading={activeShopLoading}
+        isFollowed={followedShopIds.includes(activeShopId) || Boolean(activeShopDetail?.isFollowed)}
+        followBusy={followBusyId === activeShopId}
+        onBackToShops={() => navigateShops('all')}
+        onNavigateHome={navigateHome}
+        onToggleFollow={toggleFollowShop}
+        onCopyShopLink={copyShopLink}
+        renderProductCard={renderProductCard}
+      />
+    )}
+
     {page === 'vendor' && (
       <VendorDashboard
         user={user}
@@ -2440,6 +2886,13 @@ function App() {
         orders={orders}
         money={money}
         openWallet={openWallet}
+        vendorProfileForm={vendorProfileForm}
+        setVendorProfileForm={setVendorProfileForm}
+        saveVendorProfile={saveVendorProfile}
+        uploadVendorShopMedia={uploadVendorShopMedia}
+        clearVendorShopMedia={clearVendorShopMedia}
+        shopMediaBusy={shopMediaBusy}
+        openPublicShop={openPublicShop}
       />
     )}
 
@@ -2734,12 +3187,86 @@ function App() {
           </div>
         </div>
 
+        {activeAdminOrders.length > 0 && (
+          <div
+            className={'admin-bulk-order-bar' + (selectedVisibleOrderIds.length > 0 ? ' has-selection' : '')}
+            role="region"
+            aria-label="Bulk order status actions"
+          >
+            <div className="bulk-action-summary">
+              <label className="bulk-select-all-label">
+                <input
+                  ref={selectAllOrdersCheckboxRef}
+                  type="checkbox"
+                  checked={allVisibleOrdersSelected}
+                  disabled={bulkOrderBusy}
+                  aria-label={`Select all ${activeAdminOrders.length} active orders`}
+                  onChange={() =>
+                    setSelectedOrderIds(current => toggleSelectAllVisibleOrders(current, activeAdminOrders))
+                  }
+                />
+                <span>Select all ({activeAdminOrders.length})</span>
+              </label>
+              <span className="bulk-action-sep" aria-hidden="true">·</span>
+              <span className="bulk-selection-count tabular-nums">
+                {selectedVisibleOrderIds.length > 0
+                  ? `${selectedVisibleOrderIds.length} order${selectedVisibleOrderIds.length === 1 ? '' : 's'} selected`
+                  : 'Select orders for batch status update'}
+              </span>
+            </div>
+
+            <div className="bulk-action-controls">
+              <label className="bulk-status-field">
+                <span>Batch status</span>
+                <select
+                  className="compact-stage-select"
+                  aria-label="Bulk target order status"
+                  value={bulkOrderStatus}
+                  disabled={bulkOrderBusy}
+                  onChange={e => setBulkOrderStatus(e.target.value)}
+                >
+                  {BULK_ORDER_STATUSES.map(stage => (
+                    <option key={stage} value={stage}>
+                      {stage}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="primary-btn compact-btn"
+                disabled={bulkOrderBusy || selectedVisibleOrderIds.length === 0}
+                onClick={() => void applyBulkOrderStatus()}
+              >
+                {bulkOrderBusy
+                  ? 'Updating orders...'
+                  : selectedVisibleOrderIds.length > 0
+                    ? `Apply to ${selectedVisibleOrderIds.length} order${selectedVisibleOrderIds.length === 1 ? '' : 's'}`
+                    : 'Apply batch update'}
+              </button>
+              {selectedVisibleOrderIds.length > 0 && (
+                <button
+                  type="button"
+                  className="secondary-btn compact-btn"
+                  disabled={bulkOrderBusy}
+                  onClick={() => setSelectedOrderIds([])}
+                >
+                  Clear selection
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="compact-order-list">
           {activeAdminOrders.length ? activeAdminOrders.map(order => (
             <AdminOrderRow
               key={'fulfilment-' + order.id}
               order={order}
               mode="fulfilment"
+              selectable
+              selected={selectedOrderIds.includes(order.id)}
+              onToggleSelect={(id) => setSelectedOrderIds(current => toggleOrderSelection(current, id))}
               expanded={Boolean(expandedOrderIds[order.id])}
               onToggleExpand={() => setExpandedOrderIds(current => ({ ...current, [order.id]: !current[order.id] }))}
               money={money}
@@ -2749,6 +3276,7 @@ function App() {
               onConfirmPayment={(id, manual) => void confirmPayment(id, manual)}
               onReviewPayment={(id, decision) => void reviewPayment(id, decision)}
               onResendEmails={(id) => void resendOrderEmails(id)}
+              onOpenDetails={openAdminOrderDetails}
               resendingEmail={resendingOrderId === order.id}
             />
           )) : (
@@ -2801,6 +3329,7 @@ function App() {
               onConfirmPayment={(id, manual) => void confirmPayment(id, manual)}
               onReviewPayment={(id, decision) => void reviewPayment(id, decision)}
               onResendEmails={(id) => void resendOrderEmails(id)}
+              onOpenDetails={openAdminOrderDetails}
               resendingEmail={resendingOrderId === order.id}
             />
           )) : (
@@ -3008,19 +3537,65 @@ function App() {
                         <div><small>Credential status</small><b>{u.passwordStatus || (u.hasPasswordAccount ? 'Protected' : 'Not set')}</b></div>
                       </div>
 
-                      {Array.isArray(u.recentOrders) && u.recentOrders.length > 0 && (
-                        <div className="admin-user-subbox">
-                          <b>Recent orders</b>
-                          <div className="admin-user-orders">
-                            {u.recentOrders.map((ord: any) => (
-                              <div key={ord.id} className="admin-user-order-item">
-                                <span><b>#{ord.orderNumber}</b> · {ord.status} · {ord.paymentMethod || 'Payment'} ({ord.paymentStatus})</span>
-                                <b className="tabular-nums">{money(ord.total || 0)}</b>
-                              </div>
-                            ))}
+                      {(() => {
+                        const customerOrders: Order[] =
+                          Array.isArray(u.orders) && u.orders.length
+                            ? u.orders
+                            : Array.isArray(u.recentOrders)
+                              ? u.recentOrders
+                              : [];
+                        if (!customerOrders.length) return null;
+                        return (
+                          <div className="admin-user-subbox">
+                            <div className="admin-user-orders-head">
+                              <b>Customer orders ({customerOrders.length})</b>
+                              <small className="muted">Inspect items, delivery address, payment verification, and tracking for every order</small>
+                            </div>
+                            <div className="admin-user-orders">
+                              {customerOrders.map((ord) => {
+                                const items = Array.isArray(ord.items) ? ord.items : [];
+                                const itemCount = items.reduce((sum, it) => sum + Number(it.quantity || 0), 0);
+                                const itemsPreview = items
+                                  .slice(0, 3)
+                                  .map(it => `${it.name}${it.option ? ` (${it.option})` : ''} ×${it.quantity}`)
+                                  .join(', ') + (items.length > 3 ? ` +${items.length - 3} more` : '');
+                                return (
+                                  <div key={ord.id} className="admin-user-order-item is-detailed">
+                                    <div className="admin-user-order-main">
+                                      <div className="admin-user-order-topline">
+                                        <b className="tabular-nums">#{ord.orderNumber}</b>
+                                        <span className={'status ' + (ord.status === 'Completed' ? 'approved' : ['Cancelled', 'Refunded', 'Returned'].includes(ord.status) ? 'rejected' : '')}>{ord.status}</span>
+                                        <span className={'status ' + (ord.paymentStatus === 'completed' ? 'approved' : ord.paymentStatus === 'rejected' ? 'rejected' : 'pending')}>{paymentStatusLabel(ord.paymentStatus)}</span>
+                                      </div>
+                                      <small>
+                                        {new Date(ord.createdAt).toLocaleString()} · {ord.paymentMethod || 'Payment'}
+                                        {itemCount ? ` · ${itemCount} item${itemCount === 1 ? '' : 's'}: ${itemsPreview}` : ''}
+                                      </small>
+                                      {(ord.address || ord.courier || ord.trackingNumber) && (
+                                        <small>
+                                          {ord.address ? `Address: ${ord.address}` : ''}
+                                          {ord.address && (ord.courier || ord.trackingNumber) ? ' · ' : ''}
+                                          {(ord.courier || ord.trackingNumber) ? `Tracking: ${[ord.courier, ord.trackingNumber].filter(Boolean).join(' #')}` : ''}
+                                        </small>
+                                      )}
+                                    </div>
+                                    <div className="admin-user-order-actions">
+                                      <b className="tabular-nums">{money(ord.total || 0)}</b>
+                                      <button
+                                        type="button"
+                                        className="secondary-btn compact-expand-btn"
+                                        onClick={() => openAdminOrderDetails(ord)}
+                                      >
+                                        <Eye size={14} /> Full details
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
 
                       {!isOwnerRow && (
                         <div className="admin-user-subbox admin-user-security-box">
@@ -3168,6 +3743,7 @@ function App() {
               onConfirmPayment={(id, manual) => void confirmPayment(id, manual)}
               onReviewPayment={(id, decision) => void reviewPayment(id, decision)}
               onResendEmails={(id) => void resendOrderEmails(id)}
+              onOpenDetails={openAdminOrderDetails}
               resendingEmail={resendingOrderId === order.id}
             />
           )) : (
@@ -3256,6 +3832,15 @@ function App() {
             </article>
           </section>
 
+          <OrderHistoryChart
+            filteredOrders={filteredFulfilledOrders}
+            allFulfilledOrders={allFulfilledOrders}
+            fromDate={adminHistoryFrom}
+            toDate={adminHistoryTo}
+            hasActiveFilters={Boolean(adminHistorySearch || adminHistoryStatus !== 'all' || adminHistoryFrom || adminHistoryTo)}
+            money={money}
+          />
+
           <section className="panel">
             <div className="admin-history-filters">
               <label className="admin-inline-search">
@@ -3323,6 +3908,7 @@ function App() {
                   onConfirmPayment={(id, manual) => void confirmPayment(id, manual)}
                   onReviewPayment={(id, decision) => void reviewPayment(id, decision)}
                   onResendEmails={(id) => void resendOrderEmails(id)}
+                  onOpenDetails={openAdminOrderDetails}
                   resendingEmail={resendingOrderId === order.id}
                 />
               )) : (
@@ -3338,7 +3924,58 @@ function App() {
       )}
     </main>}
 
-    {selectedProduct && <div className="overlay product-detail-overlay" onClick={closeProduct}><section className="product-detail-panel temu-detail" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI MARKETPLACE · PRODUCT</span><h2>{selectedProduct.name}</h2></div><button className="icon-btn" aria-label="Close product details" onClick={closeProduct}><X/></button></div><div className="detail-gallery"><button className="detail-main-image" onClick={()=>photoCount && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] && setPhotoViewerOpen(true)} aria-label="Open full size product photos">{selectedProduct.images?.length && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] ? <img src={selectedProduct.images[Math.min(selectedImageIndex,selectedProduct.images.length-1)]} alt={selectedProduct.name} referrerPolicy="no-referrer" onError={() => markImageFailed('detail:' + selectedProduct.id + ':' + selectedImageIndex)}/> : <div className="media-placeholder"><Package size={54}/><span>{selectedProduct.category}</span></div>}<span className="photo-open-hint">{photoCount ? 'Tap photo to view full size' : 'No product photos'}</span></button>{(selectedProduct.images?.length || 0)>1 && <div className="detail-thumbnails">{selectedProduct.images.map((url,index)=><button className={selectedImageIndex===index?'active':''} key={url+index} onClick={()=>setSelectedImageIndex(index)}><img src={url} alt={'Product view '+(index+1)} referrerPolicy="no-referrer"/></button>)}</div>}{selectedProduct.videos?.length>0 && <div className="detail-video-list">{selectedProduct.videos.map((url,index)=><video key={index} src={url} controls playsInline/> )}</div>}</div><div className="detail-product-info"><span className="product-meta-cat">{selectedProduct.category}</span><h2 className="detail-title">{selectedProduct.name}</h2><div className="detail-price-row"><b>{selectedProduct.discountActive ? <span className="sale-prices"><del>{money(selectedProduct.standardPrice || selectedProduct.price)}</del><strong>{money(selectedProduct.price)}</strong><small>-{selectedProduct.discountPercent}%</small></span> : money(selectedProduct.price)}</b><span className={selectedProduct.stock>0?'stock-live':'stock-out'}>{selectedProduct.stock>0?'In stock · '+selectedProduct.stock+' available':'Out of stock'}</span></div><p className="detail-description">{selectedProduct.description}</p><p className="muted">Sold by <strong>{selectedProduct.vendorName || 'Yakaji Digital Hub'}</strong></p><button type="button" className="secondary-btn chat-vendor-btn" onClick={()=>void openChatInbox(selectedProduct)}><MessageCircle size={16}/> Chat with vendor about this product</button><div className="product-share-panel"><b>Share this product</b><div className="product-share-actions"><button type="button" className="secondary-btn" onClick={()=>copyProductLink(selectedProduct)}><Copy size={15}/> Copy link</button><button type="button" className="primary-btn" onClick={()=>shareProduct(selectedProduct)}><Share2 size={15}/> Share</button><a className="share-social whatsapp" href={'https://wa.me/?text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price)+'. View on Yakaji Digital Hub: '+productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer"><MessageCircle size={15}/> WhatsApp</a><a className="share-social" href={'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer">Facebook</a><a className="share-social" href={'https://twitter.com/intent/tweet?url='+encodeURIComponent(productShareUrl(selectedProduct))+'&text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price))} target="_blank" rel="noopener noreferrer">X / Twitter</a></div><small className="muted">Anyone who opens this link will go directly to this product.</small></div>{selectedProduct.options?.length>0 && <label className="detail-option">Select an option<select value={selectedProductOption} onChange={e=>setSelectedProductOption(e.target.value)}>{selectedProduct.options.map(option=><option key={option}>{option}</option>)}</select></label>}<div className="detail-quantity"><b>Quantity</b><div><button disabled={detailQuantity<=1} onClick={()=>setDetailQuantity(q=>Math.max(1,q-1))}>−</button><span>{detailQuantity}</span><button disabled={detailQuantity>=selectedProduct.stock} onClick={()=>setDetailQuantity(q=>Math.min(selectedProduct.stock,q+1))}>+</button></div></div><div className="detail-assurances"><div><span className="detail-assurances-icon"><Truck size={16}/></span><p><b>Delivery arrangement</b><small>Confirm delivery details at checkout</small></p></div><div><span className="detail-assurances-icon"><Lock size={16}/></span><p><b>Secure payment choices</b><small>Wallet, Paystack or bank transfer</small></p></div><div><span className="detail-assurances-icon"><Headphones size={16}/></span><p><b>Marketplace support</b><small>Order assistance from Yakaji Digital Hub</small></p></div></div>
+    {selectedProduct && <div className="overlay product-detail-overlay" onClick={closeProduct}><section className="product-detail-panel temu-detail" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI MARKETPLACE · PRODUCT</span><h2>{selectedProduct.name}</h2></div><button className="icon-btn" aria-label="Close product details" onClick={closeProduct}><X/></button></div><div className="detail-gallery"><button className="detail-main-image" onClick={()=>photoCount && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] && setPhotoViewerOpen(true)} aria-label="Open full size product photos">{selectedProduct.images?.length && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] ? <img src={selectedProduct.images[Math.min(selectedImageIndex,selectedProduct.images.length-1)]} alt={selectedProduct.name} referrerPolicy="no-referrer" onError={() => markImageFailed('detail:' + selectedProduct.id + ':' + selectedImageIndex)}/> : <div className="media-placeholder"><Package size={54}/><span>{selectedProduct.category}</span></div>}<span className="photo-open-hint">{photoCount ? 'Tap photo to view full size' : 'No product photos'}</span></button>{(selectedProduct.images?.length || 0)>1 && <div className="detail-thumbnails">{selectedProduct.images.map((url,index)=><button className={selectedImageIndex===index?'active':''} key={url+index} onClick={()=>setSelectedImageIndex(index)}><img src={url} alt={'Product view '+(index+1)} referrerPolicy="no-referrer"/></button>)}</div>}{selectedProduct.videos?.length>0 && <div className="detail-video-list">{selectedProduct.videos.map((url,index)=><video key={index} src={url} controls playsInline/> )}</div>}</div><div className="detail-product-info"><span className="product-meta-cat">{selectedProduct.category}</span><h2 className="detail-title">{selectedProduct.name}</h2><div className="detail-price-row"><b>{selectedProduct.discountActive ? <span className="sale-prices"><del>{money(selectedProduct.standardPrice || selectedProduct.price)}</del><strong>{money(selectedProduct.price)}</strong><small>-{selectedProduct.discountPercent}%</small></span> : money(selectedProduct.price)}</b><span className={selectedProduct.stock>0?'stock-live':'stock-out'}>{selectedProduct.stock>0?'In stock · '+selectedProduct.stock+' available':'Out of stock'}</span></div><p className="detail-description">{selectedProduct.description}</p>{(() => {
+        const productShop = shops.find(s => s.id === selectedProduct.vendorId);
+        const isShopFollowed = productShop ? (followedShopIds.includes(productShop.id) || productShop.isFollowed) : false;
+        return (
+          <div className="detail-vendor-card">
+            <div className="detail-vendor-info">
+              <ShopAvatar
+                shopName={productShop?.shopName || selectedProduct.vendorName || 'Yakaji Digital Hub'}
+                iconUrl={productShop?.iconUrl}
+                size="sm"
+              />
+              <div>
+                <b>{productShop?.shopName || selectedProduct.vendorName || 'Yakaji Digital Hub'}</b>
+                <small className="tabular-nums">
+                  {productShop
+                    ? `${productShop.followerCount} follower${productShop.followerCount === 1 ? '' : 's'} · ${productShop.productCount} listing${productShop.productCount === 1 ? '' : 's'}`
+                    : 'Verified Marketplace Seller'}
+                </small>
+              </div>
+            </div>
+            <div className="detail-vendor-actions">
+              {productShop && (
+                <>
+                  <button
+                    type="button"
+                    className={isShopFollowed ? 'follow-shop-btn is-following sm' : 'follow-shop-btn sm'}
+                    disabled={followBusyId === productShop.id}
+                    onClick={() => void toggleFollowShop(productShop)}
+                  >
+                    {isShopFollowed ? <Check size={14} /> : <Heart size={14} />}
+                    <span>{isShopFollowed ? 'Following' : 'Follow'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={() => openPublicShop(productShop.id)}
+                  >
+                    <Store size={14} /> Visit shop
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                className="secondary-btn chat-vendor-btn"
+                onClick={() => void openChatInbox(selectedProduct)}
+              >
+                <MessageCircle size={15} /> Chat
+              </button>
+            </div>
+          </div>
+        );
+      })()}<div className="product-share-panel"><b>Share this product</b><div className="product-share-actions"><button type="button" className="secondary-btn" onClick={()=>copyProductLink(selectedProduct)}><Copy size={15}/> Copy link</button><button type="button" className="primary-btn" onClick={()=>shareProduct(selectedProduct)}><Share2 size={15}/> Share</button><a className="share-social whatsapp" href={'https://wa.me/?text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price)+'. View on Yakaji Digital Hub: '+productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer"><MessageCircle size={15}/> WhatsApp</a><a className="share-social" href={'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer">Facebook</a><a className="share-social" href={'https://twitter.com/intent/tweet?url='+encodeURIComponent(productShareUrl(selectedProduct))+'&text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price))} target="_blank" rel="noopener noreferrer">X / Twitter</a></div><small className="muted">Anyone who opens this link will go directly to this product.</small></div>{selectedProduct.options?.length>0 && <label className="detail-option">Select an option<select value={selectedProductOption} onChange={e=>setSelectedProductOption(e.target.value)}>{selectedProduct.options.map(option=><option key={option}>{option}</option>)}</select></label>}<div className="detail-quantity"><b>Quantity</b><div><button disabled={detailQuantity<=1} onClick={()=>setDetailQuantity(q=>Math.max(1,q-1))}>−</button><span>{detailQuantity}</span><button disabled={detailQuantity>=selectedProduct.stock} onClick={()=>setDetailQuantity(q=>Math.min(selectedProduct.stock,q+1))}>+</button></div></div><div className="detail-assurances"><div><span className="detail-assurances-icon"><Truck size={16}/></span><p><b>Delivery arrangement</b><small>Confirm delivery details at checkout</small></p></div><div><span className="detail-assurances-icon"><Lock size={16}/></span><p><b>Secure payment choices</b><small>Wallet, Paystack or bank transfer</small></p></div><div><span className="detail-assurances-icon"><Headphones size={16}/></span><p><b>Marketplace support</b><small>Order assistance from Yakaji Digital Hub</small></p></div></div>
       <section className="product-review-section">
         <div className="review-heading">
           <div>
@@ -3427,6 +4064,23 @@ function App() {
     {manualTransferOrder && <div className="overlay" onClick={()=>setManualTransferOrder(null)}><section className="checkout transfer-instructions" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">MANUAL BANK TRANSFER</span><h2>{manualTransferOrder.creditAmount ? 'Fund your wallet' : 'Complete your payment'}</h2></div><button className="icon-btn" onClick={()=>setManualTransferOrder(null)}><X/></button></div><div className="transfer-card"><p>{manualTransferOrder.creditAmount ? 'Top-up reference:' : 'Order number:'} <b>{manualTransferOrder.orderNumber}</b></p>{manualTransferOrder.creditAmount && <p>Wallet amount to credit: <b>{money(manualTransferOrder.creditAmount)}</b> · Fee: {money(manualTransferOrder.fee || 0)}</p>}<p>Amount to transfer: <strong>{money(manualTransferOrder.total)}</strong></p><hr/><p>Account name</p><h3>Yakaji Digital Hub</h3><p>Account number</p><h2>3005758913</h2><p>Bank</p><h3>Moniepoint MFB</h3>{manualTransferOrder.creditAmount && <p className="checkout-note">Use the top-up reference above as your transfer narration so the owner can identify your payment.</p>}<button className="secondary-btn full-btn" onClick={()=>navigator.clipboard?.writeText('3005758913').then(()=>flash('Account number copied.'))}>Copy account number</button></div><p className="checkout-note">After making the transfer, keep your receipt. Your order or wallet top-up will remain pending until Yakaji Digital Hub confirms the money received. Do not make a second payment for the same reference.</p><button className="primary-btn full-btn" onClick={()=>setManualTransferOrder(null)}>I understand</button></section></div>}
     {notificationsOpen && <div className="overlay" onClick={()=>setNotificationsOpen(false)}><section className="checkout notifications-panel" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI DIGITAL HUB</span><h2>Notifications</h2></div><button className="icon-btn" onClick={()=>setNotificationsOpen(false)}><X/></button></div><div className="notification-actions"><button className="secondary-btn" onClick={enablePushNotifications}>Enable device alerts</button>{unreadNotifications>0 && <button className="secondary-btn" onClick={markAllNotificationsRead}>Mark all as read</button>}</div><div className="notification-list">{userNotifications.length ? userNotifications.map(n=><article className={'notification-item '+(n.read?'read':'unread')} key={n.id} onClick={()=>void openNotificationTarget(n)} role="button" tabIndex={0}><span className="notification-dot">{n.kind==='order'?<Package size={16}/>:n.kind==='chat'?<MessageSquare size={16}/>:n.kind==='announcement'?<Megaphone size={16}/>:<Bell size={16}/>}</span><div className="notification-copy"><b>{n.title}</b><p>{n.message}</p><small>{new Date(n.createdAt).toLocaleString()}</small>{!n.read && <button type="button" className="notification-mark-read" onClick={e => { e.stopPropagation(); void markNotificationRead(String(n.id)); }}>Mark as read</button>}</div></article>) : <div className="empty-box"><Bell size={34}/><h3>You're all caught up</h3><p>Order updates, vendor approvals and announcements will appear here.</p></div>}</div></section></div>}
     {chatOpen && <div className="overlay" onClick={()=>setChatOpen(false)}><section className="checkout chat-panel" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">DIRECT MESSAGING</span><h2>Messages</h2></div><button className="icon-btn" onClick={()=>setChatOpen(false)}><X/></button></div><div className="chat-layout"><aside className="chat-conversations">{chatConversations.length ? chatConversations.map(c=><button key={c.id} className={activeChatId===c.id?'active':''} onClick={()=>setActiveChatId(c.id)}><b>{user?.userId===c.vendorId?c.customerName:c.vendorName}</b><small>{c.productName}</small><span>{c.lastMessage || 'Start the conversation'}</span></button>) : <p className="muted">No conversations yet. Open a product and select “Chat with vendor”.</p>}</aside><div className="chat-thread"><div className="chat-thread-title">{chatConversations.find(c=>c.id===activeChatId)?.productName || 'Select a conversation'}<small>Private messages between customer and vendor</small></div><div className="chat-message-list">{chatMessages.map(m=><div key={m.id} className={'chat-bubble '+(m.senderId===user?.userId?'mine':'theirs')}><b>{m.senderName}</b><p>{m.message}</p><small>{new Date(m.createdAt).toLocaleString()}</small></div>)}</div><form className="chat-compose" onSubmit={sendChatMessage}><input value={chatDraft} onChange={e=>setChatDraft(e.target.value)} placeholder="Write a message..." maxLength={2000} disabled={!activeChatId}/><button className="primary-btn" disabled={!activeChatId || !chatDraft.trim() || chatBusy}><ArrowRight size={16}/></button></form></div></div></section></div>}
+    {isAdmin && activeDetailOrder && (
+      <AdminOrderDetailsModal
+        order={activeDetailOrder}
+        onClose={() => {
+          setDetailOrderId('');
+          setDetailOrderFallback(null);
+        }}
+        money={money}
+        paymentStatusLabel={paymentStatusLabel}
+        onChangeStatus={(id, status) => void changeOrderStatus(id, status)}
+        onUpdateOrder={(id, patch) => updateAdminOrder(id, patch)}
+        onConfirmPayment={(id, manual) => void confirmPayment(id, manual)}
+        onReviewPayment={(id, decision) => void reviewPayment(id, decision)}
+        onResendEmails={(id) => void resendOrderEmails(id)}
+        resendingEmail={resendingOrderId === activeDetailOrder.id}
+      />
+    )}
     {error && <div className="alert-error"><span>{error}</span><button onClick={()=>setError('')}><X size={16}/></button></div>}
     {notice && <div className="toast"><CheckCircle2 size={18}/>{notice}</div>}
     {!isAdmin && page !== 'support' && <button type="button" className="floating-support-help" onClick={()=>setPage('support')} aria-label="Open customer support"><MessageCircle size={18}/><span>Live Support</span></button>}
