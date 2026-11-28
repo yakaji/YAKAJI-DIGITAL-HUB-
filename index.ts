@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { router, json, error, db, storage, secrets, notifications, requireAuth, requireAdminEmailAllowlist, increment, ws, ai, type AuthUser } from './server/appdeploy-sdk';
+import { router, json, error, db, storage, getStoredMedia, secrets, notifications, requireAuth, requireAdminEmailAllowlist, increment, ws, ai, type AuthUser, type RouteContext } from './server/appdeploy-sdk';
 import {
   buildSessionCookie,
   clearSessionCookie,
@@ -16,12 +16,62 @@ import {
   runDatabaseBackup,
   verifyBackupIntegrity,
 } from './server/backup-service';
+import {
+  computeVerificationExpiry,
+  computeVerificationFee,
+  getVendorEntitlements,
+  isVendorVerificationActive,
+  validateVendorCouponCreation,
+  validateVendorProductAgainstEntitlements,
+  validateVerificationKycPayload,
+  type VendorVerificationRecord,
+} from './src/utils/vendorVerification';
+import {
+  buildAnnouncementViewerContext,
+  computeAnnouncementRecipients,
+  computeVendorFollowerRecipients,
+  filterVisibleAnnouncements,
+  normalizeAdminAnnouncementAudience,
+  type MarketplaceAnnouncement,
+} from './src/utils/announcements';
+import {
+  calculateCryptoCheckoutBreakdown,
+  formatUsdt,
+  normalizeCryptoRateMode,
+  normalizeCryptoSettings,
+  parseGoogleFinanceRateHtml,
+  sanitizeCryptoSettingsForPublic,
+  shouldAutoRefreshGoogleRate,
+  validateCheckoutCryptoSelection,
+  validateCryptoPricingInput,
+  validateCryptoTxHash,
+  validateCryptoWalletInput,
+  type CryptoCheckoutBreakdown,
+  type CryptoSettings,
+  type CryptoWalletConfig,
+} from './src/utils/cryptoPayments';
 
 const ADMIN_EMAILS = ['salimaminu103@gmail.com'];
 const ADMIN_OWNER_ID = 'owner-salimaminu103';
 const admin = [requireAuth(), requireAdminEmailAllowlist(ADMIN_EMAILS)];
 const fail = (message: string, status = 400) => error(message, status);
 const safeId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+function resolveCallbackOrigin(req?: RouteContext['req']): string {
+  const fallback = 'https://yakaji-digital-hub-q2nkcp.v2.appdeploy.ai';
+  if (!req) return fallback;
+  const originHeader = String(req.headers.origin || '').trim();
+  if (/^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?$/.test(originHeader)) {
+    return originHeader;
+  }
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const host = forwardedHost || String(req.headers.host || '').trim();
+  if (host && /^[a-zA-Z0-9.-]+(:\d+)?$/.test(host)) {
+    const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'http' || host.startsWith('localhost') || host.startsWith('127.0.0.1') ? 'http' : 'https';
+    return `${proto}://${host}`;
+  }
+  return fallback;
+}
 
 function jsonWithCookie(body: unknown, cookieValue: string, statusCode = 200) {
   return {
@@ -459,7 +509,11 @@ async function notifyNewOrder(order: OrderRecord) {
     const shopName = String(vendorMap.get(item.vendorId)?.shopName || 'Yakaji Digital Hub');
     return `<li><b>${htmlSafe(item.name)}</b>${item.option ? ' (' + htmlSafe(item.option) + ')' : ''} × ${item.quantity} — ${money(item.price * item.quantity)} <span style="color:#64748b;">[Shop: ${htmlSafe(shopName)}]</span></li>`;
   }).join('');
-  const customerDetails = `<p><b>Customer:</b> ${htmlSafe(order.customerName)}<br/><b>Phone:</b> ${htmlSafe(order.phone)}<br/><b>Email:</b> ${htmlSafe(customerEmail || 'Not provided')}<br/><b>Address / instructions:</b> ${htmlSafe(order.address || 'Not provided')}<br/><b>Payment method:</b> ${htmlSafe(order.paymentMethod)} (${htmlSafe(String(order.paymentStatus || 'pending'))})</p>`;
+  const cryptoExtra =
+    order.paymentMethod === 'Crypto' && (order as Record<string, unknown>).cryptoTotalUsdt
+      ? `<br/><b>Crypto amount due:</b> ${htmlSafe(formatUsdt(Number((order as Record<string, unknown>).cryptoTotalUsdt)))} (incl. ${htmlSafe(formatUsdt(Number((order as Record<string, unknown>).cryptoTransferFeeUsdt ?? 1)))} transfer fee @ ₦${Number((order as Record<string, unknown>).cryptoUsdtRate || 1600).toLocaleString('en-US')}/USDT)`
+      : '';
+  const customerDetails = `<p><b>Customer:</b> ${htmlSafe(order.customerName)}<br/><b>Phone:</b> ${htmlSafe(order.phone)}<br/><b>Email:</b> ${htmlSafe(customerEmail || 'Not provided')}<br/><b>Address / instructions:</b> ${htmlSafe(order.address || 'Not provided')}<br/><b>Payment method:</b> ${htmlSafe(order.paymentMethod)} (${htmlSafe(String(order.paymentStatus || 'pending'))})${cryptoExtra}</p>`;
   const adminHtml = emailShell(
     'YAKAJI DIGITAL HUB · NEW ORDER ALERT',
     `New order received: ${String(order.orderNumber || '')}`,
@@ -498,11 +552,18 @@ async function notifyNewOrder(order: OrderRecord) {
   await Promise.all(tasks);
 }
 
-async function notifyUser(userId: string, title: string, message: string, kind = 'marketplace', link = '') {
+async function notifyUser(
+  userId: string,
+  title: string,
+  message: string,
+  kind = 'marketplace',
+  link = '',
+  extraFields?: Record<string, unknown>
+) {
   if (!userId) return { stored: false, pushSent: 0, pushFailed: 0 };
   const createdAt = new Date().toISOString();
   const id = safeId();
-  await db.tx.add('user_notifications', [{ id, userId, title: title.slice(0, 120), message: message.slice(0, 500), kind, link, read: false, pushStatus: 'pending', createdAt }]);
+  await db.tx.add('user_notifications', [{ id, userId, title: title.slice(0, 120), message: message.slice(0, 500), kind, link, ...(extraFields || {}), read: false, pushStatus: 'pending', createdAt }]);
   try {
     const delivery = await notifications.send({
       userIds: [userId],
@@ -554,6 +615,12 @@ async function hydrateVendorShops(
   const mediaUrls = mediaPaths.length ? await storage.url(mediaPaths) : [];
   const urlByPath = new Map(mediaUrls.map(item => [item.path, item.url]));
 
+  let verificationByVendorId = new Map<string, VendorVerificationRecord>();
+  if (opts.includePrivate) {
+    const verifications = await listAll<VendorVerificationRecord>('vendor_verifications');
+    verificationByVendorId = new Map(verifications.map(ver => [String(ver.vendorId || ver.id), ver]));
+  }
+
   return vendorRows.map(v => {
     const vid = String(v.id || '');
     const iconPath = String(v.iconPath || '');
@@ -570,6 +637,17 @@ async function hydrateVendorShops(
       }
     }
     const averageRating = reviewCount > 0 ? Math.round((ratingSum / reviewCount) * 10) / 10 : 0;
+    const isVerified = isVendorVerificationActive({
+      status: String(v.status || ''),
+      isVerified: Boolean(v.isVerified),
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+    });
+    const entitlements = getVendorEntitlements({
+      status: String(v.status || ''),
+      isVerified: Boolean(v.isVerified),
+      verificationTier: v.verificationTier ? String(v.verificationTier) : undefined,
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+    });
     const base = {
       id: vid,
       shopName: String(v.shopName || 'Vendor Shop'),
@@ -594,6 +672,12 @@ async function hydrateVendorShops(
       isFollowed: opts.viewerUserId
         ? shopFollows.some(f => String(f.userId || '') === opts.viewerUserId)
         : false,
+      isVerified,
+      verificationTier: isVerified ? String(v.verificationTier || 'starter') : '',
+      verificationTierRank: entitlements.directoryPriorityRank,
+      badgeScope: entitlements.badgeScope,
+      verifiedAt: v.verifiedAt ? String(v.verifiedAt) : '',
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : '',
       createdAt: String(v.createdAt || ''),
       updatedAt: String(v.updatedAt || v.createdAt || ''),
     };
@@ -603,6 +687,8 @@ async function hydrateVendorShops(
         ...base,
         email: String(v.email || ''),
         status: String(v.status || 'pending'),
+        entitlements,
+        verification: verificationByVendorId.get(vid) || null,
       };
     }
     return base;
@@ -631,15 +717,46 @@ function buildReviewStatsMap(reviews: Array<Record<string, unknown>>): Map<strin
   return stats;
 }
 async function listProducts(filter?: Record<string, unknown>) {
-  const [rows, reviews] = await Promise.all([
+  const [rows, reviews, vendors] = await Promise.all([
     listAll<Record<string, unknown>>('products'),
     listAll<Record<string, unknown>>('product_reviews'),
+    listAll<Record<string, unknown>>('vendors'),
   ]);
   const reviewStats = buildReviewStatsMap(reviews);
+  const verifiedMap = new Map<string, { isVerified: boolean; tier: string; badgeScope: string }>();
+  for (const v of vendors) {
+    const active = isVendorVerificationActive({
+      status: String(v.status || ''),
+      isVerified: Boolean(v.isVerified),
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+    });
+    if (active) {
+      const ent = getVendorEntitlements({
+        status: String(v.status || ''),
+        isVerified: Boolean(v.isVerified),
+        verificationTier: String(v.verificationTier || 'starter'),
+        verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+      });
+      verifiedMap.set(String(v.id), {
+        isVerified: true,
+        tier: String(v.verificationTier || 'starter'),
+        badgeScope: ent.badgeScope,
+      });
+    }
+  }
   const filtered = filter ? rows.filter(p => Object.entries(filter).every(([k, v]) => p[k] === v)) : rows;
-  return Promise.all(filtered.map(p => publicProduct(p, reviewStats.get(String(p.id || '')))));
+  return Promise.all(
+    filtered.map(p => {
+      const vMeta = verifiedMap.get(String(p.vendorId || ''));
+      return publicProduct(p, reviewStats.get(String(p.id || '')), vMeta);
+    })
+  );
 }
-const publicProduct = async (p: Record<string, unknown>, stats?: ReviewStats) => {
+const publicProduct = async (
+  p: Record<string, unknown>,
+  stats?: ReviewStats,
+  vendorBadge?: { isVerified: boolean; tier: string; badgeScope?: string }
+) => {
   const paths = [...((p.images as string[]) || []), ...((p.videos as string[]) || [])];
   const urls = paths.length ? await storage.url(paths) : [];
   const byPath = new Map(urls.map(x => [x.path, x.url]));
@@ -652,6 +769,9 @@ const publicProduct = async (p: Record<string, unknown>, stats?: ReviewStats) =>
     discountPercent: discountActive ? Math.round((standardPrice - price) / standardPrice * 100) : 0,
     averageRating,
     reviewCount,
+    vendorVerified: Boolean(vendorBadge?.isVerified),
+    vendorVerificationTier: vendorBadge?.tier || '',
+    vendorBadgeScope: vendorBadge?.badgeScope || 'none',
     imagePaths: (p.images as string[]) || [], videoPaths: (p.videos as string[]) || [],
     images: ((p.images as string[]) || []).map(x => byPath.get(x) || ''),
     videos: ((p.videos as string[]) || []).map(x => byPath.get(x) || '') };
@@ -805,6 +925,120 @@ async function marketSettings() {
     commissionPercent = 8;
   }
   return { customerTransferFee: Number(row?.customerTransferFee ?? 100), withdrawalFee: Number(row?.withdrawalFee ?? 100), walletFundingFee: 100, commissionPercent, cashbackPercent: Number(row?.cashbackPercent ?? 1) };
+}
+
+let inflightGoogleRateRefresh: Promise<CryptoSettings> | null = null;
+
+async function fetchLiveGoogleUsdtNgnRate(): Promise<{ rate: number; source: string; syncedAt: string }> {
+  const syncedAt = new Date().toISOString();
+
+  // 1. Primary attempt: Google Finance USD-NGN quote page
+  try {
+    const gfRes = await fetch('https://www.google.com/finance/quote/USD-NGN?hl=en', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; YakajiDigitalHub/1.0)',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (gfRes.ok) {
+      const html = await gfRes.text();
+      const parsed = parseGoogleFinanceRateHtml(html);
+      if (parsed !== null) {
+        const valid = validateCryptoPricingInput({ usdtNgnRate: parsed, transferFeeUsdt: 1 });
+        if (valid.ok) {
+          return { rate: valid.usdtNgnRate, source: 'Google Finance (USD/NGN)', syncedAt };
+        }
+      }
+    }
+  } catch {
+    // Fall through to live FX JSON feeds
+  }
+
+  // 2. Reliable live FX JSON fallback 1 (Open Exchange Rates API)
+  try {
+    const erRes = await fetch('https://open.er-api.com/v6/latest/USD', {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (erRes.ok) {
+      const data = (await erRes.json()) as { rates?: { NGN?: unknown } };
+      const valid = validateCryptoPricingInput({ usdtNgnRate: data?.rates?.NGN, transferFeeUsdt: 1 });
+      if (valid.ok) {
+        return { rate: valid.usdtNgnRate, source: 'Google / Live FX USD-NGN Feed', syncedAt };
+      }
+    }
+  } catch {
+    // Fall through to secondary live FX feed
+  }
+
+  // 3. Secondary live FX JSON fallback
+  try {
+    const cdnRes = await fetch('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (cdnRes.ok) {
+      const data = (await cdnRes.json()) as { usd?: { ngn?: unknown } };
+      const valid = validateCryptoPricingInput({ usdtNgnRate: data?.usd?.ngn, transferFeeUsdt: 1 });
+      if (valid.ok) {
+        return { rate: valid.usdtNgnRate, source: 'Live Global FX (USD/NGN)', syncedAt };
+      }
+    }
+  } catch {
+    // Throw explicit error below
+  }
+
+  throw new Error('Could not reach live Google / USD-NGN exchange rate feeds right now. Enter a manual rate or retry shortly.');
+}
+
+async function persistCryptoSettingsRecord(settings: CryptoSettings): Promise<CryptoSettings> {
+  const normalized = normalizeCryptoSettings(settings);
+  const record = {
+    id: 'marketplace_crypto',
+    enabled: normalized.enabled,
+    usdtNgnRate: normalized.usdtNgnRate,
+    rateMode: normalized.rateMode,
+    rateSource: normalized.rateSource,
+    lastRateSyncedAt: normalized.lastRateSyncedAt,
+    transferFeeUsdt: normalized.transferFeeUsdt,
+    checkoutNote: normalized.checkoutNote,
+    wallets: normalized.wallets,
+    updatedAt: new Date().toISOString(),
+  };
+  const [ok] = await db.tx.update('settings', [{ id: 'marketplace_crypto', record }], { patch: true });
+  if (!ok) await db.tx.add('settings', [record]);
+  return normalized;
+}
+
+async function getCryptoSettings(options?: { skipAutoRefresh?: boolean }): Promise<CryptoSettings> {
+  const [row] = await db.get<Record<string, unknown>>('settings', ['marketplace_crypto']);
+  const normalized = normalizeCryptoSettings(row);
+  if (options?.skipAutoRefresh || !shouldAutoRefreshGoogleRate(normalized)) {
+    return normalized;
+  }
+
+  if (!inflightGoogleRateRefresh) {
+    inflightGoogleRateRefresh = (async () => {
+      try {
+        const live = await fetchLiveGoogleUsdtNgnRate();
+        return await persistCryptoSettingsRecord({
+          ...normalized,
+          usdtNgnRate: live.rate,
+          rateMode: 'auto_google',
+          rateSource: live.source,
+          lastRateSyncedAt: live.syncedAt,
+        });
+      } catch (err) {
+        console.warn('Auto Google USDT/NGN rate refresh skipped:', err instanceof Error ? err.message : err);
+        return normalized;
+      } finally {
+        inflightGoogleRateRefresh = null;
+      }
+    })();
+  }
+
+  return inflightGoogleRateRefresh;
 }
 
 async function profileResponse(profile: Record<string, unknown> | null, user: { userId: string; email?: string; name?: string }) {
@@ -1956,7 +2190,11 @@ export const handler = router({
     if (existing && existing.user_id === user!.userId) await db.delete('entity_subscriptions', [id]);
     return json({ unsubscribed: true });
   }],
-  'GET /api/settings/public': [async () => { const settings = await marketSettings(); const { commissionPercent, ...publicSettings } = settings; return json({ settings: publicSettings }); }],
+  'GET /api/settings/public': [async () => {
+    const [settings, cryptoSettings] = await Promise.all([marketSettings(), getCryptoSettings()]);
+    const { commissionPercent, ...publicSettings } = settings;
+    return json({ settings: publicSettings, crypto: sanitizeCryptoSettingsForPublic(cryptoSettings) });
+  }],
   'GET /api/payments/status': [async () => {
     const names = await secrets.listSecretNames();
     if (!names.includes('PAYSTACK_SECRET_KEY')) {
@@ -2112,6 +2350,99 @@ export const handler = router({
     if (!ok) await db.tx.add('settings', [{ id: 'marketplace', ...settings }]);
     return json({ settings });
   }],
+  'GET /api/admin/crypto-settings': [...admin, async () => {
+    return json({ crypto: await getCryptoSettings() });
+  }],
+  'PUT /api/admin/crypto-settings': [...admin, async ({ body }) => {
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      enabled?: unknown;
+      usdtNgnRate?: unknown;
+      rateMode?: unknown;
+      rateSource?: unknown;
+      lastRateSyncedAt?: unknown;
+      transferFeeUsdt?: unknown;
+      checkoutNote?: unknown;
+      wallets?: unknown;
+    };
+    const existingCrypto = await getCryptoSettings({ skipAutoRefresh: true });
+    const pricingCheck = validateCryptoPricingInput({
+      usdtNgnRate: b.usdtNgnRate ?? existingCrypto.usdtNgnRate,
+      transferFeeUsdt: b.transferFeeUsdt ?? existingCrypto.transferFeeUsdt,
+    });
+    if (!pricingCheck.ok) {
+      return fail(pricingCheck.error);
+    }
+    const rawWallets = Array.isArray(b.wallets) ? b.wallets : [];
+    if (rawWallets.length > 24) {
+      return fail('You can configure up to 24 cryptocurrency payment networks.');
+    }
+    const validatedWallets: CryptoWalletConfig[] = [];
+    for (const entry of rawWallets) {
+      const checked = validateCryptoWalletInput(entry as Partial<CryptoWalletConfig>);
+      if (!checked.ok) {
+        return fail(checked.error);
+      }
+      validatedWallets.push(checked.wallet);
+    }
+    const nextRateMode = normalizeCryptoRateMode(b.rateMode ?? existingCrypto.rateMode);
+    const nextRateSource =
+      nextRateMode === 'manual'
+        ? 'Manual owner rate'
+        : String(b.rateSource || existingCrypto.rateSource || 'Google USD/NGN Live FX');
+    const nextLastSynced = String(existingCrypto.lastRateSyncedAt || b.lastRateSyncedAt || '');
+
+    const saved = await persistCryptoSettingsRecord({
+      enabled: Boolean(b.enabled),
+      usdtNgnRate: pricingCheck.usdtNgnRate,
+      rateMode: nextRateMode,
+      rateSource: nextRateSource,
+      lastRateSyncedAt: nextLastSynced,
+      transferFeeUsdt: pricingCheck.transferFeeUsdt,
+      checkoutNote: typeof b.checkoutNote === 'string' ? b.checkoutNote : existingCrypto.checkoutNote,
+      wallets: validatedWallets,
+    });
+    return json({ crypto: saved, message: 'Cryptocurrency payment settings and USDT exchange rate saved.' });
+  }],
+  'POST /api/admin/crypto-settings/sync-google-rate': [...admin, async ({ body }) => {
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      enableAutoSync?: unknown;
+      enabled?: unknown;
+      transferFeeUsdt?: unknown;
+      checkoutNote?: unknown;
+    };
+    const existingCrypto = await getCryptoSettings({ skipAutoRefresh: true });
+    const pricingCheck = validateCryptoPricingInput({
+      usdtNgnRate: existingCrypto.usdtNgnRate,
+      transferFeeUsdt: b.transferFeeUsdt ?? existingCrypto.transferFeeUsdt,
+    });
+    if (!pricingCheck.ok) {
+      return fail(pricingCheck.error);
+    }
+    let live: { rate: number; source: string; syncedAt: string };
+    try {
+      live = await fetchLiveGoogleUsdtNgnRate();
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : 'Unable to sync live Google exchange rate right now.', 502);
+    }
+    const nextMode = b.enableAutoSync === false ? existingCrypto.rateMode : 'auto_google';
+    const saved = await persistCryptoSettingsRecord({
+      ...existingCrypto,
+      enabled: typeof b.enabled === 'boolean' ? b.enabled : existingCrypto.enabled,
+      usdtNgnRate: live.rate,
+      rateMode: nextMode,
+      rateSource: live.source,
+      lastRateSyncedAt: live.syncedAt,
+      transferFeeUsdt: pricingCheck.transferFeeUsdt,
+      checkoutNote: typeof b.checkoutNote === 'string' ? b.checkoutNote : existingCrypto.checkoutNote,
+    });
+    return json({
+      crypto: saved,
+      syncedRate: live.rate,
+      rateSource: live.source,
+      lastRateSyncedAt: live.syncedAt,
+      message: `Live USDT rate synced (${live.rate.toLocaleString('en-NG')} NGN / 1 USDT) via ${live.source}.`,
+    });
+  }],
   'GET /api/products': [async () => json({ products: await listProducts({ status: 'approved' }) })],
   'GET /api/products/:id': [async ({ params }) => {
     const [product] = await db.get<Record<string, unknown>>('products', [params.id]);
@@ -2200,6 +2531,51 @@ export const handler = router({
     }
     await db.transact(writes);
     return json({ cancelled: true, message: 'Your unpaid order has been cancelled.' });
+  }],
+  'PUT /api/customer/orders/:id/crypto-tx-hash': [requireAuth(), async ({ user, params, body }) => {
+    const [order] = await db.get<OrderRecord>('orders', [params.id], { consistent: true });
+    const userEmail = String(user!.email || '').trim().toLowerCase();
+    const ownsOrder = order && (
+      String((order as Record<string, unknown>).customerUserId || '') === user!.userId ||
+      (userEmail && String(order.email || '').trim().toLowerCase() === userEmail)
+    );
+    if (!ownsOrder) return fail('Order not found for this account.', 404);
+    if (order.paymentMethod !== 'Crypto') {
+      return fail('Transaction hashes can only be submitted for cryptocurrency orders.');
+    }
+    if (order.paymentStatus === 'completed') {
+      return fail('This order payment has already been verified and completed.');
+    }
+    if (['Cancelled', 'Refunded', 'Returned'].includes(String(order.status || ''))) {
+      return fail('Closed or cancelled orders cannot accept a transaction hash.');
+    }
+    const b = (body && typeof body === 'object' ? body : {}) as { cryptoTxHash?: unknown };
+    const checked = validateCryptoTxHash(b.cryptoTxHash);
+    if (!checked.ok) return fail(checked.error);
+    const submittedAt = new Date().toISOString();
+    const patch = {
+      cryptoTxHash: checked.txHash,
+      cryptoTxSubmittedAt: submittedAt,
+      paymentReference: checked.txHash,
+      paymentStatus: 'pending',
+      paymentRejectedAt: null,
+      paymentReviewNote: '',
+      updatedAt: submittedAt,
+    };
+    await db.tx.update('orders', [{ id: order.id, record: patch }], { patch: true });
+    await notifyUser(
+      ADMIN_OWNER_ID,
+      'Crypto TX hash submitted',
+      `Customer submitted TX hash ${checked.txHash} for order ${String(order.orderNumber || order.id)}.`,
+      'order',
+      '/?view=admin&orderId=' + encodeURIComponent(order.id)
+    );
+    const { commissionPercent, ...sanitizedOrder } = { ...order, ...patch };
+    return json({
+      updated: true,
+      order: sanitizedOrder,
+      message: 'Transaction hash submitted and queued for on-chain verification.',
+    });
   }],
   'GET /api/products/:id/reviews': [async ({ params }) => {
     const reviews = (await listAll<Record<string, unknown>>('product_reviews'))
@@ -2436,18 +2812,30 @@ export const handler = router({
   }],
 
   'POST /api/orders': [async ({ body, user }) => {
-    const b = body as { customerName?: string; phone?: string; email?: string; address?: string; paymentMethod?: string; couponCode?: string; referralCode?: string; items?: Array<{ productId: string; quantity: number; option?: string }> };
+    const b = body as { customerName?: string; phone?: string; email?: string; address?: string; paymentMethod?: string; couponCode?: string; referralCode?: string; cryptoWalletId?: string; cryptoTxHash?: string; items?: Array<{ productId: string; quantity: number; option?: string }> };
     const paymentMethod = String(b.paymentMethod || 'Paystack');
     let customerEmail = String(b.email || '').trim();
     if (!customerEmail && user?.userId) {
       const [profile] = await db.get<Record<string, unknown>>('profiles', [user.userId]);
       customerEmail = String(user.email || profile?.email || '').trim();
     }
-    if (!['Paystack', 'Bank transfer', 'Wallet'].includes(paymentMethod)) return fail('Choose wallet, Paystack or manual bank transfer.');
+    if (!['Paystack', 'Bank transfer', 'Wallet', 'Crypto'].includes(paymentMethod)) return fail('Choose wallet, Paystack, bank transfer or cryptocurrency.');
     if (paymentMethod === 'Wallet' && !user?.userId) return fail('Sign in to pay with your wallet.');
     if (!b.customerName?.trim() || !b.phone?.trim() || !Array.isArray(b.items) || !b.items.length) return fail('Please enter your name, phone number and at least one product.');
     if (paymentMethod === 'Paystack' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) return fail('Enter a valid email address for your Paystack receipt.');
     if (b.items.length > 30) return fail('Your cart has too many different products.');
+
+    let selectedCryptoWallet: CryptoWalletConfig | null = null;
+    let selectedCryptoTxHash = '';
+    let cryptoConfigSnapshot: Awaited<ReturnType<typeof getCryptoSettings>> | null = null;
+    if (paymentMethod === 'Crypto') {
+      cryptoConfigSnapshot = await getCryptoSettings();
+      const checked = validateCheckoutCryptoSelection(cryptoConfigSnapshot, b.cryptoWalletId, b.cryptoTxHash);
+      if (!checked.ok) return fail(checked.error);
+      selectedCryptoWallet = checked.wallet;
+      selectedCryptoTxHash = checked.txHash;
+    }
+
     const ids = [...new Set(b.items.map(x => x.productId))];
     const records = await db.get<Record<string, unknown>>('products', ids);
     const byId = new Map(ids.map((id, i) => [id, records[i]]));
@@ -2471,7 +2859,21 @@ export const handler = router({
     catch (e) { return fail(e instanceof Error ? e.message : 'Invalid coupon code.'); }
     const couponDiscount = couponResult.discount;
     const settings = await marketSettings();
-    const transferFee = paymentMethod === 'Bank transfer' ? settings.customerTransferFee : 0;
+    let cryptoBreakdown: CryptoCheckoutBreakdown | null = null;
+    if (paymentMethod === 'Crypto' && cryptoConfigSnapshot) {
+      cryptoBreakdown = calculateCryptoCheckoutBreakdown({
+        ngnSubtotal: subtotal,
+        couponDiscount,
+        usdtNgnRate: cryptoConfigSnapshot.usdtNgnRate,
+        transferFeeUsdt: cryptoConfigSnapshot.transferFeeUsdt,
+      });
+    }
+    const transferFee =
+      paymentMethod === 'Bank transfer'
+        ? settings.customerTransferFee
+        : paymentMethod === 'Crypto' && cryptoBreakdown
+          ? cryptoBreakdown.transferFeeNgn
+          : 0;
     const total = Math.max(0, subtotal - couponDiscount) + transferFee;
     let walletAccount: Record<string, unknown> | null = null;
     if (paymentMethod === 'Wallet') {
@@ -2486,6 +2888,21 @@ export const handler = router({
       id: orderId, orderNumber, customerName: b.customerName.trim(), phone: b.phone.trim(),
       email: customerEmail, address: (b.address || '').trim(), customerUserId: user?.userId || '',
       paymentMethod,
+      ...(selectedCryptoWallet && cryptoBreakdown ? {
+        cryptoWalletId: selectedCryptoWallet.id,
+        cryptoCoin: selectedCryptoWallet.coin,
+        cryptoSymbol: selectedCryptoWallet.symbol,
+        cryptoNetwork: selectedCryptoWallet.network,
+        cryptoAddress: selectedCryptoWallet.address,
+        cryptoInstructions: selectedCryptoWallet.instructions || '',
+        cryptoTxHash: selectedCryptoTxHash,
+        cryptoTxSubmittedAt: selectedCryptoTxHash ? new Date().toISOString() : '',
+        cryptoUsdtRate: cryptoBreakdown.usdtNgnRate,
+        cryptoItemsUsdt: cryptoBreakdown.itemsUsdt,
+        cryptoTransferFeeUsdt: cryptoBreakdown.transferFeeUsdt,
+        cryptoTotalUsdt: cryptoBreakdown.totalUsdt,
+        paymentReference: selectedCryptoTxHash || `${selectedCryptoWallet.symbol}-${selectedCryptoWallet.network}`,
+      } : {}),
       items: lineItems, subtotal, couponCode: couponResult.coupon ? String(couponResult.coupon.code) : '', couponDiscount, transferFee, total, commissionPercent, ...(affiliate ? { affiliateId: String(affiliate.id), affiliateReferralCode: String(affiliate.referralCode) } : {}), status: 'New', paymentStatus: paymentMethod === 'Wallet' ? 'completed' : 'pending', ...(paymentMethod === 'Wallet' ? { paymentCompletedAt: new Date().toISOString() } : {}), createdAt: new Date().toISOString()
     };
     let authorizationUrl = '';
@@ -2516,7 +2933,37 @@ export const handler = router({
     } else {
       await notifyNewOrder(order);
     }
-    return json({ orderId, orderNumber, total, couponDiscount, authorizationUrl, paymentMethod, emailDelivery: paymentEmailResult, bankTransfer: paymentMethod === 'Bank transfer' ? { accountName: 'Yakaji Digital Hub', accountNumber: '3005758913', bankName: 'Moniepoint MFB' } : null, message: paymentMethod === 'Wallet' ? 'Order paid successfully. Receipt and confirmation emails were attempted for customer, vendor, and admin.' : 'Order received. Vendor and admin new-order email notifications were attempted.' }, 201);
+    return json({
+      orderId,
+      orderNumber,
+      total,
+      transferFee,
+      couponDiscount,
+      authorizationUrl,
+      paymentMethod,
+      emailDelivery: paymentEmailResult,
+      bankTransfer: paymentMethod === 'Bank transfer' ? { accountName: 'Yakaji Digital Hub', accountNumber: '3005758913', bankName: 'Moniepoint MFB' } : null,
+      cryptoPayment: selectedCryptoWallet && cryptoBreakdown ? {
+        walletId: selectedCryptoWallet.id,
+        coin: selectedCryptoWallet.coin,
+        symbol: selectedCryptoWallet.symbol,
+        network: selectedCryptoWallet.network,
+        address: selectedCryptoWallet.address,
+        instructions: selectedCryptoWallet.instructions || '',
+        txHash: selectedCryptoTxHash,
+        usdtNgnRate: cryptoBreakdown.usdtNgnRate,
+        itemsUsdt: cryptoBreakdown.itemsUsdt,
+        transferFeeUsdt: cryptoBreakdown.transferFeeUsdt,
+        transferFeeNgn: cryptoBreakdown.transferFeeNgn,
+        totalUsdt: cryptoBreakdown.totalUsdt,
+        totalNgn: cryptoBreakdown.totalNgn,
+      } : null,
+      message: paymentMethod === 'Wallet'
+        ? 'Order paid successfully. Receipt and confirmation emails were attempted for customer, vendor, and admin.'
+        : paymentMethod === 'Crypto'
+          ? 'Order placed with USDT / cryptocurrency checkout. Send the exact USDT total (including the 1.00 USDT transfer fee) for admin verification.'
+          : 'Order received. Vendor and admin new-order email notifications were attempted.'
+    }, 201);
   }],
 
   'POST /api/orders/wallet': [requireAuth(), async ({ body, user }) => {
@@ -2897,6 +3344,17 @@ export const handler = router({
     };
     const kind = b.kind === 'cover' ? 'cover' : b.kind === 'icon' ? 'icon' : '';
     if (!kind) return fail('Specify whether you are uploading a shop icon or cover image.');
+    if (kind === 'cover') {
+      const entitlements = getVendorEntitlements({
+        status: String(existing.status || ''),
+        isVerified: Boolean(existing.isVerified),
+        verificationTier: existing.verificationTier ? String(existing.verificationTier) : undefined,
+        verifiedUntil: existing.verifiedUntil ? String(existing.verifiedUntil) : undefined,
+      });
+      if (!entitlements.allowCoverBanner) {
+        return fail('Custom shop cover banners unlock on Starter (₦3,000/month or ₦28,800/year) and above. Shop icon uploads are free on all plans.', 403);
+      }
+    }
     if (!b.base64 || !String(b.contentType || '').startsWith('image/')) return fail('Choose a valid image file (PNG, JPG or WebP).');
     if (b.base64.length > 11200000) return fail('Shop images must be 8MB or smaller.');
     const safeName = String(b.fileName || `${kind}-image`).replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -2934,6 +3392,326 @@ export const handler = router({
     const savedVendor = await getVendor(user!.userId);
     if (!savedVendor) return fail('Could not verify saved vendor application in database. Please try again.', 500);
     return json({ vendor: savedVendor }, 201);
+  }],
+  'GET /api/vendor/verification': [requireAuth(), async ({ user }) => {
+    const vendor = await getVendor(user!.userId);
+    if (!vendor) return json({ vendor: null, verification: null });
+    const [hydrated] = await hydrateVendorShops([{ ...vendor, id: user!.userId }], {
+      viewerUserId: user!.userId,
+      includePrivate: true,
+    });
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    const names = await secrets.listSecretNames();
+    return json({
+      vendor: hydrated || vendor,
+      verification: verification || null,
+      paystackConfigured: names.includes('PAYSTACK_SECRET_KEY'),
+    });
+  }],
+  'POST /api/vendor/verification/payment': [requireAuth(), async ({ user, body, req }) => {
+    const vendor = await requireApprovedVendor({ user });
+    if (!vendor) return fail('Your vendor shop must be approved before applying for shop verification.', 403);
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      tierId?: string;
+      billingCycle?: string;
+      paymentMethod?: string;
+    };
+    const paymentMethod = String(b.paymentMethod || 'Paystack');
+    if (!['Paystack', 'Wallet', 'Bank transfer'].includes(paymentMethod)) {
+      return fail('Choose Paystack, Wallet, or Bank transfer.');
+    }
+    const feeBreakdown = computeVerificationFee(b.tierId, b.billingCycle);
+    const [existing] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    if (existing && existing.status === 'pending_review') {
+      return fail('Your verification submission is already under admin review.', 409);
+    }
+    if (existing && existing.paymentStatus === 'paid' && existing.status === 'paid_awaiting_details') {
+      return fail('Your verification payment is already confirmed. Proceed to Step 2 and attach your CAC and National ID.', 409);
+    }
+    const now = new Date().toISOString();
+    const reference = 'VFY-' + user!.userId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase() + '-' + Date.now();
+    const record: Record<string, unknown> = {
+      ...(existing || {}),
+      id: user!.userId,
+      vendorId: user!.userId,
+      shopName: String(vendor.shopName || 'Vendor Shop'),
+      tierId: feeBreakdown.tier.id,
+      tierName: feeBreakdown.tier.name,
+      billingCycle: feeBreakdown.cycle.id,
+      durationDays: feeBreakdown.durationDays,
+      monthlyRate: feeBreakdown.monthlyRate,
+      baseAmount: feeBreakdown.baseAmount,
+      discountPercent: feeBreakdown.discountPercent,
+      discountAmount: feeBreakdown.discountAmount,
+      feeAmount: feeBreakdown.totalAmount,
+      paymentMethod,
+      paymentStatus: paymentMethod === 'Bank transfer' ? 'pending_confirmation' : 'pending',
+      paymentReference: reference,
+      status: 'awaiting_payment',
+      rejectionReason: '',
+      updatedAt: now,
+      createdAt: existing?.createdAt || now,
+    };
+
+    let authorizationUrl = '';
+    if (paymentMethod === 'Paystack') {
+      const names = await secrets.listSecretNames();
+      if (!names.includes('PAYSTACK_SECRET_KEY')) {
+        return fail('Paystack is not configured on this server. Choose Wallet or manual bank transfer, or configure PAYSTACK_SECRET_KEY.');
+      }
+      const key = await secrets.readSecret('PAYSTACK_SECRET_KEY');
+      const payerEmail = String(vendor.email || user!.email || '').trim();
+      if (!payerEmail || !isValidEmail(payerEmail)) {
+        return fail('A valid vendor email address is required to pay with Paystack.');
+      }
+      const callbackOrigin = resolveCallbackOrigin(req);
+      const response = await fetch('https://api.paystack.co/transaction/initialize', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: payerEmail,
+          amount: feeBreakdown.amountKobo,
+          currency: 'NGN',
+          reference,
+          callback_url: `${callbackOrigin}/?vendor_verify=paystack`,
+          metadata: {
+            vendor_id: user!.userId,
+            shop_name: String(vendor.shopName || ''),
+            tier_id: feeBreakdown.tier.id,
+            billing_cycle: feeBreakdown.cycle.id,
+            payment_type: 'vendor_shop_verification',
+          },
+        }),
+      });
+      const result = await response.json() as {
+        status?: boolean;
+        message?: string;
+        data?: { authorization_url?: string; reference?: string };
+      };
+      if (!response.ok || !result.status || !result.data?.authorization_url) {
+        return fail(result.message || 'Paystack could not initialize the verification payment.');
+      }
+      authorizationUrl = result.data.authorization_url;
+    }
+
+    if (paymentMethod === 'Wallet') {
+      const account = await ensureWalletAccount(user!.userId);
+      const balance = Number(account.balance || 0);
+      if (balance < feeBreakdown.totalAmount) {
+        return fail('Your wallet balance is insufficient for this verification tier. Fund your wallet or pay with Paystack.');
+      }
+      const txId = 'vendor-verify-' + reference;
+      await db.transact([
+        db.tx.update('wallet_accounts', [{ id: user!.userId, record: { balance: increment(-feeBreakdown.totalAmount), updatedAt: now }, if: { balance } }], { patch: true }),
+        db.tx.add('wallet_transactions', [{
+          id: txId,
+          userId: user!.userId,
+          amount: -feeBreakdown.totalAmount,
+          type: 'debit',
+          description: `Shop verification (${feeBreakdown.tier.name} · ${feeBreakdown.cycle.shortLabel})`,
+          reference,
+          actorId: user!.userId,
+          createdAt: now,
+        }]),
+      ]);
+      record.paymentStatus = 'paid';
+      record.paidAt = now;
+      record.status = 'paid_awaiting_details';
+    }
+
+    const [saved] = existing
+      ? await db.tx.update('vendor_verifications', [{ id: user!.userId, record }], { patch: true })
+      : await db.tx.add('vendor_verifications', [record]);
+    if (!saved) return fail('Could not save your verification payment record.', 500);
+
+    await db.tx.update('vendors', [{
+      id: user!.userId,
+      record: {
+        verificationStatus: String(record.status),
+        pendingVerificationTier: feeBreakdown.tier.id,
+        updatedAt: now,
+      },
+    }], { patch: true });
+
+    const [confirmed] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    return json({
+      verification: confirmed,
+      authorizationUrl,
+      bankTransfer: paymentMethod === 'Bank transfer'
+        ? {
+            bankName: 'Moniepoint MFB',
+            accountName: 'Yakaji Digital Hub',
+            accountNumber: '3005758913',
+            amount: feeBreakdown.totalAmount,
+            reference,
+          }
+        : null,
+    }, 201);
+  }],
+  'POST /api/vendor/verification/paystack/verify': [requireAuth(), async ({ user, body }) => {
+    const vendor = await requireApprovedVendor({ user });
+    if (!vendor) return fail('Approved vendor account required.', 403);
+    const reference = String((body as { reference?: string }).reference || '').trim();
+    if (!reference) return fail('Missing Paystack verification reference.');
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    if (!verification || verification.paymentMethod !== 'Paystack' || verification.paymentReference !== reference) {
+      return fail('Shop verification payment record was not found for this reference.', 404);
+    }
+    if (verification.paymentStatus === 'paid') {
+      return json({ verified: true, verification });
+    }
+    const key = await secrets.readSecret('PAYSTACK_SECRET_KEY');
+    if (!key) return fail('Paystack is not configured on the server.', 500);
+    const response = await fetch('https://api.paystack.co/transaction/verify/' + encodeURIComponent(reference), {
+      headers: { Authorization: 'Bearer ' + key },
+    });
+    const result = await response.json() as {
+      status?: boolean;
+      data?: { status?: string; amount?: number; currency?: string; reference?: string };
+    };
+    const expectedKobo = Math.round(Number(verification.feeAmount || 0) * 100);
+    if (
+      !response.ok ||
+      !result.status ||
+      result.data?.status !== 'success' ||
+      result.data.currency !== 'NGN' ||
+      Number(result.data.amount) !== expectedKobo ||
+      result.data.reference !== reference
+    ) {
+      return fail('Paystack has not confirmed the full shop verification payment.');
+    }
+    const now = new Date().toISOString();
+    const [ok] = await db.tx.update('vendor_verifications', [{
+      id: user!.userId,
+      record: {
+        paymentStatus: 'paid',
+        paidAt: now,
+        paystackVerifiedAt: now,
+        status: 'paid_awaiting_details',
+        updatedAt: now,
+      },
+      if: { paymentStatus: 'pending' },
+    }], { patch: true });
+    if (!ok) return fail('Verification payment was checked but status update conflicted. Refresh and retry.', 409);
+    await db.tx.update('vendors', [{
+      id: user!.userId,
+      record: { verificationStatus: 'paid_awaiting_details', updatedAt: now },
+    }], { patch: true });
+    const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    return json({ verified: true, verification: updated });
+  }],
+  'POST /api/vendor/verification/document': [requireAuth(), async ({ user, body }) => {
+    const vendor = await requireApprovedVendor({ user });
+    if (!vendor) return fail('Your vendor shop must be approved before uploading verification documents.', 403);
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    if (!verification || verification.paymentStatus !== 'paid') {
+      return fail('Complete verification payment first before attaching your CAC certificate or National ID card.', 403);
+    }
+    if (verification.status === 'pending_review') {
+      return fail('Your documents are currently under admin review.', 409);
+    }
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      kind?: string;
+      fileName?: string;
+      contentType?: string;
+      base64?: string;
+    };
+    const kind = b.kind === 'cac' ? 'cac' : b.kind === 'national_id' ? 'national_id' : '';
+    if (!kind) return fail('Specify whether you are uploading a CAC certificate or National ID card.');
+    const contentType = String(b.contentType || '').trim().toLowerCase();
+    const allowedMime = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf'];
+    if (!b.base64 || !allowedMime.includes(contentType)) {
+      return fail('Upload a valid PNG, JPG, WebP image or PDF document.');
+    }
+    if (b.base64.length > 11200000) {
+      return fail('Verification documents must be 8MB or smaller.');
+    }
+    const safeName = String(b.fileName || `${kind}-document`).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
+    const storagePath = `vendor-kyc/${user!.userId}/${kind}-${safeId()}-${safeName}`;
+    const [written] = await storage.write([{ path: storagePath, content: b.base64, contentType }]);
+    if (!written) return fail('Could not store verification document. Please try again.', 500);
+
+    const now = new Date().toISOString();
+    const patch = kind === 'cac'
+      ? { cacDocumentPath: storagePath, cacDocumentName: safeName, cacDocumentContentType: contentType, updatedAt: now }
+      : { nationalIdDocumentPath: storagePath, nationalIdDocumentName: safeName, nationalIdDocumentContentType: contentType, updatedAt: now };
+
+    const [saved] = await db.tx.update('vendor_verifications', [{ id: user!.userId, record: patch }], { patch: true });
+    if (!saved) return fail('Could not attach uploaded document to verification record.', 500);
+    const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    return json({ kind, fileName: safeName, contentType, verification: updated });
+  }],
+  'POST /api/vendor/verification/submit': [requireAuth(), async ({ user, body }) => {
+    const vendor = await requireApprovedVendor({ user });
+    if (!vendor) return fail('Your vendor shop must be approved before submitting verification details.', 403);
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    if (!verification || verification.paymentStatus !== 'paid') {
+      return fail('Complete your verification tier payment before submitting business and ID details.', 403);
+    }
+    if (verification.status === 'pending_review') {
+      return fail('Your verification submission is already awaiting admin approval.', 409);
+    }
+    const validated = validateVerificationKycPayload((body && typeof body === 'object' ? body : {}) as Record<string, unknown>, {
+      hasCacDocument: Boolean(verification.cacDocumentPath),
+      hasNationalIdDocument: Boolean(verification.nationalIdDocumentPath),
+    });
+    if (!validated.ok) return fail(validated.error);
+
+    const now = new Date().toISOString();
+    const [saved] = await db.tx.update('vendor_verifications', [{
+      id: user!.userId,
+      record: {
+        ...validated.clean,
+        shopName: String(vendor.shopName || verification.shopName || ''),
+        documentsSubmittedAt: now,
+        status: 'pending_review',
+        rejectionReason: '',
+        updatedAt: now,
+      },
+    }], { patch: true });
+    if (!saved) return fail('Could not submit verification details. Please try again.', 500);
+
+    await db.tx.update('vendors', [{
+      id: user!.userId,
+      record: {
+        verificationStatus: 'pending_review',
+        pendingVerificationTier: verification.tierId,
+        updatedAt: now,
+      },
+    }], { patch: true });
+
+    await notifyUser(
+      ADMIN_OWNER_ID,
+      'New shop verification request',
+      `${String(vendor.shopName || 'A vendor shop')} completed ${String(verification.tierName || 'Starter')} payment and submitted CAC & National ID for approval.`,
+      'vendor_verification',
+      '/admin'
+    );
+
+    const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    return json({
+      verification: updated,
+      message: 'Your CAC, National ID, and business details have been submitted for admin verification.',
+    });
+  }],
+  'GET /api/vendor/verification/document/:kind': [requireAuth(), async ({ user, params }) => {
+    const kind = params.kind === 'cac' ? 'cac' : params.kind === 'national_id' ? 'national_id' : '';
+    if (!kind) return fail('Invalid document type.', 400);
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [user!.userId], { consistent: true });
+    if (!verification) return fail('Verification record not found.', 404);
+    const docPath = kind === 'cac' ? verification.cacDocumentPath : verification.nationalIdDocumentPath;
+    if (!docPath) return fail('Document has not been uploaded yet.', 404);
+    const asset = await getStoredMedia(docPath);
+    if (!asset) return fail('Stored document could not be found.', 404);
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': asset.contentType || 'application/octet-stream',
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+      body: asset.buffer,
+    };
   }],
   'GET /api/vendor/wallet': [requireAuth(), async ({ user }) => {
     const vendor = await requireApprovedVendor({ user });
@@ -3157,6 +3935,21 @@ export const handler = router({
   'POST /api/vendor/coupons': [requireAuth(), async ({ user, body }) => {
     const vendor = await requireApprovedVendor({ user });
     if (!vendor) return fail('Your vendor shop must be approved before creating coupons.', 403);
+    const entitlements = getVendorEntitlements({
+      status: String(vendor.status || ''),
+      isVerified: Boolean(vendor.isVerified),
+      verificationTier: vendor.verificationTier ? String(vendor.verificationTier) : undefined,
+      verifiedUntil: vendor.verifiedUntil ? String(vendor.verifiedUntil) : undefined,
+    });
+    const allCoupons = await listAll<Record<string, unknown>>('coupons');
+    const activeVendorCoupons = allCoupons.filter(
+      coupon =>
+        coupon.vendorId === user!.userId &&
+        coupon.status === 'active' &&
+        Date.parse(String(coupon.expiresAt || '')) > Date.now()
+    );
+    const couponCheck = validateVendorCouponCreation(entitlements, activeVendorCoupons.length);
+    if (!couponCheck.ok) return fail(couponCheck.error, 403);
     const b = body as Record<string, unknown>;
     const code = String(b.code || '').trim().toUpperCase();
     const discountType = String(b.discountType || 'percentage');
@@ -3173,7 +3966,6 @@ export const handler = router({
       const owned = await db.get<Record<string, unknown>>('products', productIds);
       if (owned.some(product => !product || product.vendorId !== user!.userId)) return fail('You can only attach coupons to your own products.');
     }
-    const allCoupons = await listAll<Record<string, unknown>>('coupons');
     if (allCoupons.some(coupon => String(coupon.code || '').toUpperCase() === code)) return fail('This coupon code is already in use on the marketplace. Choose a different code.');
     const id = safeId();
     const [saved] = await db.tx.add('coupons', [{ id, vendorId: user!.userId, vendorName: String(vendor.shopName), code, discountType, discountValue,
@@ -3214,6 +4006,12 @@ export const handler = router({
   'POST /api/vendor/products': [requireAuth(), async ({ user, body }) => {
     const v = await requireApprovedVendor({ user });
     if (!v) return fail('Your vendor shop must be approved before publishing products.', 403);
+    const entitlements = getVendorEntitlements({
+      status: String(v.status || ''),
+      isVerified: Boolean(v.isVerified),
+      verificationTier: v.verificationTier ? String(v.verificationTier) : undefined,
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+    });
     const b = body as Record<string, unknown>;
     if (!String(b.name || '').trim() || Number(b.price) <= 0 || !String(b.description || '').trim()) return fail('Enter a product name, valid price and description.');
     const affiliateCommissionPercent = Number(b.affiliateCommissionPercent ?? 0);
@@ -3221,14 +4019,29 @@ export const handler = router({
     const standardPrice = Number(b.price);
     const discountPrice = Math.max(0, Number(b.discountPrice || 0));
     if (discountPrice > 0 && (discountPrice >= standardPrice || discountPrice <= 0)) return fail('Discount price must be lower than the standard price.');
+    const images = Array.isArray(b.images) ? b.images : [];
+    const videos = Array.isArray(b.videos) ? b.videos : [];
+    const discountStartAt = b.discountStartAt ? new Date(String(b.discountStartAt)).toISOString() : '';
+    const discountEndAt = b.discountEndAt ? new Date(String(b.discountEndAt)).toISOString() : '';
+    const vendorProductCount = (await listAll<Record<string, unknown>>('products')).filter(p => String(p.vendorId || '') === user!.userId).length;
+    const check = validateVendorProductAgainstEntitlements(entitlements, {
+      isNew: true,
+      currentProductCount: vendorProductCount,
+      imageCount: images.length,
+      videoCount: videos.length,
+      discountPrice,
+      hasFlashSchedule: Boolean(discountStartAt || discountEndAt),
+      affiliateCommissionPercent,
+    });
+    if (!check.ok) return fail(check.error, 403);
     const id = safeId();
     const [saved] = await db.tx.add('products', [{ id, name: String(b.name).trim(), category: String(b.category || 'Other'),
       price: standardPrice, discountPrice, discountPercent: discountPrice > 0 ? Math.round((standardPrice - discountPrice) / standardPrice * 100) : 0,
-      discountStartAt: b.discountStartAt ? new Date(String(b.discountStartAt)).toISOString() : '',
-      discountEndAt: b.discountEndAt ? new Date(String(b.discountEndAt)).toISOString() : '',
+      discountStartAt,
+      discountEndAt,
       description: String(b.description).trim(), stock: Math.max(0, Math.floor(Number(b.stock) || 0)),
       tag: String(b.tag || 'New'), affiliateCommissionPercent, options: Array.isArray(b.options) ? b.options : [],
-      images: Array.isArray(b.images) ? b.images : [], videos: Array.isArray(b.videos) ? b.videos : [],
+      images, videos,
       vendorId: user!.userId, vendorName: String(v.shopName), status: 'pending', createdAt: new Date().toISOString() }]);
     if (!saved) return fail('Could not save product.', 500);
     return json({ id, status: 'pending' }, 201);
@@ -3238,20 +4051,45 @@ export const handler = router({
     if (!v) return fail('Your vendor shop must be approved.', 403);
     const [old] = await db.get<Record<string, unknown>>('products', [params.id]);
     if (!old || old.vendorId !== user!.userId) return fail('Product not found or permission denied.', 404);
+    const entitlements = getVendorEntitlements({
+      status: String(v.status || ''),
+      isVerified: Boolean(v.isVerified),
+      verificationTier: v.verificationTier ? String(v.verificationTier) : undefined,
+      verifiedUntil: v.verifiedUntil ? String(v.verifiedUntil) : undefined,
+    });
     const b = body as Record<string, unknown>;
     const affiliateCommissionPercent = Number(b.affiliateCommissionPercent ?? old.affiliateCommissionPercent ?? 0);
     if (!Number.isInteger(affiliateCommissionPercent) || (affiliateCommissionPercent !== 0 && (affiliateCommissionPercent < 5 || affiliateCommissionPercent > 25))) return fail('Affiliate commission must be 0% or a whole percentage from 5% to 25%.');
     const standardPrice = Number(b.price ?? old.price);
     const discountPrice = Math.max(0, Number(b.discountPrice ?? old.discountPrice ?? 0));
     if (discountPrice > 0 && discountPrice >= standardPrice) return fail('Discount price must be lower than the standard price.');
+    const images = Array.isArray(b.images) ? b.images : (Array.isArray(old.images) ? old.images : []);
+    const videos = Array.isArray(b.videos) ? b.videos : (Array.isArray(old.videos) ? old.videos : []);
+    const discountStartAt = b.discountStartAt !== undefined ? (b.discountStartAt ? new Date(String(b.discountStartAt)).toISOString() : '') : String(old.discountStartAt || '');
+    const discountEndAt = b.discountEndAt !== undefined ? (b.discountEndAt ? new Date(String(b.discountEndAt)).toISOString() : '') : String(old.discountEndAt || '');
+    const check = validateVendorProductAgainstEntitlements(entitlements, {
+      isNew: false,
+      currentProductCount: 0,
+      imageCount: images.length,
+      videoCount: videos.length,
+      discountPrice,
+      hasFlashSchedule: Boolean(discountStartAt || discountEndAt),
+      affiliateCommissionPercent,
+      previousImageCount: Array.isArray(old.images) ? old.images.length : 0,
+      previousVideoCount: Array.isArray(old.videos) ? old.videos.length : 0,
+      previousDiscountPrice: Number(old.discountPrice || 0),
+      previousHasFlashSchedule: Boolean(old.discountStartAt || old.discountEndAt),
+      previousAffiliateCommissionPercent: Number(old.affiliateCommissionPercent || 0),
+    });
+    if (!check.ok) return fail(check.error, 403);
     const [ok] = await db.tx.update('products', [{ id: params.id, record: {
       name: String(b.name || old.name), category: String(b.category || old.category), price: standardPrice,
       discountPrice, discountPercent: discountPrice > 0 ? Math.round((standardPrice - discountPrice) / standardPrice * 100) : 0,
-      discountStartAt: b.discountStartAt !== undefined ? (b.discountStartAt ? new Date(String(b.discountStartAt)).toISOString() : '') : old.discountStartAt,
-      discountEndAt: b.discountEndAt !== undefined ? (b.discountEndAt ? new Date(String(b.discountEndAt)).toISOString() : '') : old.discountEndAt,
+      discountStartAt,
+      discountEndAt,
       description: String(b.description ?? old.description), stock: Math.max(0, Math.floor(Number(b.stock ?? old.stock))),
       tag: String(b.tag || old.tag), affiliateCommissionPercent, options: Array.isArray(b.options) ? b.options : old.options,
-      images: Array.isArray(b.images) ? b.images : old.images, videos: Array.isArray(b.videos) ? b.videos : old.videos,
+      images, videos,
       status: 'pending', updatedAt: new Date().toISOString()
     } }], { patch: true });
     return ok ? json({ updated: true }) : fail('Could not update product.', 500);
@@ -3278,8 +4116,20 @@ export const handler = router({
   'POST /api/media': [requireAuth(), async ({ user, body }) => {
     const vendor = await requireApprovedVendor({ user });
     const b = body as { fileName?: string; contentType?: string; base64?: string };
-    if (!vendor && user!.email?.toLowerCase() !== ADMIN_EMAILS[0]) return fail('Only approved vendors and the marketplace owner can upload product media.', 403);
+    const isAdminUser = user!.email?.toLowerCase() === ADMIN_EMAILS[0];
+    if (!vendor && !isAdminUser) return fail('Only approved vendors and the marketplace owner can upload product media.', 403);
     if (!b.base64 || !b.contentType || (!b.contentType.startsWith('image/') && !b.contentType.startsWith('video/'))) return fail('Choose a valid image or video file.');
+    if (!isAdminUser && vendor && b.contentType.startsWith('video/')) {
+      const entitlements = getVendorEntitlements({
+        status: String(vendor.status || ''),
+        isVerified: Boolean(vendor.isVerified),
+        verificationTier: vendor.verificationTier ? String(vendor.verificationTier) : undefined,
+        verifiedUntil: vendor.verifiedUntil ? String(vendor.verifiedUntil) : undefined,
+      });
+      if (!entitlements.allowProductVideos) {
+        return fail('Product promo video uploads unlock on Plus (₦5,000/month), Premium, and Pro Max verification tiers.', 403);
+      }
+    }
     const path = 'market-media/' + user!.userId + '/' + safeId() + '-' + String(b.fileName || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_');
     const [ok] = await storage.write([{ path, content: b.base64, contentType: b.contentType }]);
     if (!ok) return fail('Media upload failed. Please try again.', 500);
@@ -3558,6 +4408,207 @@ export const handler = router({
     if (ok) await notifyUser(params.id, 'Vendor application update', 'Your vendor application status is now: ' + String(b.status) + '.', 'vendor', '/');
     return ok ? json({ updated: true }) : fail('Vendor not found.', 404);
   }],
+  'GET /api/admin/verifications': [...admin, async () => {
+    const [verifications, vendors] = await Promise.all([
+      listAll<VendorVerificationRecord>('vendor_verifications'),
+      listAll<Record<string, unknown>>('vendors'),
+    ]);
+    const vendorMap = new Map(vendors.map(v => [String(v.id), v]));
+    const enriched = verifications
+      .map(ver => {
+        const vendor = vendorMap.get(String(ver.vendorId || ver.id));
+        return {
+          ...ver,
+          vendorShopName: String(vendor?.shopName || ver.shopName || 'Vendor Shop'),
+          vendorOwnerName: String(vendor?.ownerName || ver.ownerFullName || ''),
+          vendorEmail: String(vendor?.email || ver.ownerEmail || ''),
+          vendorPhone: String(vendor?.phone || ver.ownerPhone || ''),
+          vendorStatus: String(vendor?.status || 'pending'),
+          isCurrentlyVerified: vendor ? isVendorVerificationActive({
+            status: String(vendor.status || ''),
+            isVerified: Boolean(vendor.isVerified),
+            verifiedUntil: vendor.verifiedUntil ? String(vendor.verifiedUntil) : undefined,
+          }) : false,
+        };
+      })
+      .sort((a, b) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')));
+    return json({ verifications: enriched });
+  }],
+  'GET /api/admin/vendors/:id/verification/document/:kind': [...admin, async ({ params, params: { id } }) => {
+    const kind = params.kind === 'cac' ? 'cac' : params.kind === 'national_id' ? 'national_id' : '';
+    if (!kind) return fail('Invalid document type.', 400);
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [id], { consistent: true });
+    if (!verification) return fail('Verification record not found.', 404);
+    const docPath = kind === 'cac' ? verification.cacDocumentPath : verification.nationalIdDocumentPath;
+    if (!docPath) return fail('Document was not attached.', 404);
+    const asset = await getStoredMedia(docPath);
+    if (!asset) return fail('Stored document file not found.', 404);
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': asset.contentType || 'application/octet-stream',
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+      body: asset.buffer,
+    };
+  }],
+  'POST /api/admin/verifications/:id/confirm-transfer': [...admin, async ({ params, user }) => {
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [params.id], { consistent: true });
+    if (!verification || verification.paymentMethod !== 'Bank transfer') {
+      return fail('Manual bank transfer verification payment not found.', 404);
+    }
+    if (verification.paymentStatus === 'paid') {
+      return json({ confirmed: true, alreadyConfirmed: true, verification });
+    }
+    if (verification.paymentStatus !== 'pending_confirmation') {
+      return fail('This verification payment is not awaiting transfer confirmation.');
+    }
+    const now = new Date().toISOString();
+    const [ok] = await db.tx.update('vendor_verifications', [{
+      id: params.id,
+      record: {
+        paymentStatus: 'paid',
+        paidAt: now,
+        paymentConfirmedBy: user!.userId,
+        status: 'paid_awaiting_details',
+        updatedAt: now,
+      },
+      if: { paymentStatus: 'pending_confirmation' },
+    }], { patch: true });
+    if (!ok) return fail('Could not confirm transfer payment.', 409);
+    await db.tx.update('vendors', [{
+      id: params.id,
+      record: { verificationStatus: 'paid_awaiting_details', updatedAt: now },
+    }], { patch: true });
+    await notifyUser(
+      params.id,
+      'Verification payment confirmed',
+      'Your shop verification payment is confirmed. Open Seller Centre -> Verification to attach your CAC certificate, National ID, and business details.',
+      'vendor_verification',
+      '/'
+    );
+    const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [params.id], { consistent: true });
+    return json({ confirmed: true, verification: updated });
+  }],
+  'PUT /api/admin/verifications/:id/review': [...admin, async ({ params, body, user }) => {
+    const b = (body && typeof body === 'object' ? body : {}) as {
+      decision?: string;
+      reason?: string;
+      adminNotes?: string;
+    };
+    const decision = String(b.decision || '').trim().toLowerCase();
+    if (!['approved', 'rejected', 'revoked'].includes(decision)) {
+      return fail('Decision must be approved, rejected, or revoked.');
+    }
+    const [verification] = await db.get<VendorVerificationRecord>('vendor_verifications', [params.id], { consistent: true });
+    const vendor = await getVendor(params.id);
+    if (!verification || !vendor) return fail('Vendor verification submission not found.', 404);
+
+    const now = new Date().toISOString();
+    const adminNotes = String(b.adminNotes || '').trim().slice(0, 600);
+    const reason = String(b.reason || '').trim().slice(0, 600);
+
+    if (decision === 'approved') {
+      if (verification.paymentStatus !== 'paid') {
+        return fail('Verification payment must be confirmed as paid before approving.');
+      }
+      if (!verification.cacDocumentPath || !verification.nationalIdDocumentPath || !verification.cacNumber || !verification.nationalIdNumber) {
+        return fail('Vendor must attach both CAC certificate and National ID card before verification can be approved.');
+      }
+      const existingUntilMs = vendor.isVerified && vendor.verifiedUntil ? Date.parse(String(vendor.verifiedUntil)) : NaN;
+      const expiryBaseIso = Number.isFinite(existingUntilMs) && existingUntilMs > Date.now()
+        ? new Date(existingUntilMs).toISOString()
+        : now;
+      const verifiedUntil = computeVerificationExpiry(expiryBaseIso, Number(verification.durationDays || 30));
+      const [okVer] = await db.tx.update('vendor_verifications', [{
+        id: params.id,
+        record: {
+          status: 'verified',
+          verifiedAt: vendor.verifiedAt || now,
+          verifiedUntil,
+          reviewedAt: now,
+          reviewedBy: user!.userId,
+          rejectionReason: '',
+          adminNotes,
+          updatedAt: now,
+        },
+      }], { patch: true });
+      const [okVendor] = await db.tx.update('vendors', [{
+        id: params.id,
+        record: {
+          isVerified: true,
+          verificationStatus: 'verified',
+          verificationTier: verification.tierId,
+          verificationTierName: verification.tierName,
+          pendingVerificationTier: '',
+          verifiedAt: vendor.verifiedAt || now,
+          verifiedUntil,
+          updatedAt: now,
+        },
+      }], { patch: true });
+      if (!okVer || !okVendor) return fail('Could not complete verification approval.', 500);
+
+      await notifyUser(
+        params.id,
+        'Shop verified — Blue tick activated',
+        `Congratulations! ${String(vendor.shopName)} is now verified on ${String(verification.tierName || 'Starter')}. Your blue verified tick is live on your shop profile and storefront.`,
+        'vendor_verification',
+        '/'
+      );
+      if (vendor.email) {
+        void sendEmail(
+          String(vendor.email),
+          `Your shop ${String(vendor.shopName)} is now Verified`,
+          emailShell(
+            'VERIFIED MERCHANT · BLUE BADGE ACTIVE',
+            `${String(vendor.shopName)} is verified`,
+            `${String(verification.tierName || 'Starter')} plan · Active until ${new Date(verifiedUntil).toLocaleDateString()}`,
+            `<p>Hello <b>${htmlSafe(verification.ownerFullName || vendor.ownerName || 'Merchant')}</b>,</p><p>Your CAC certificate, National ID, and business details have been reviewed and approved. Your shop now displays the official <b>blue verified tick</b> on your storefront and profile.</p>`
+          ),
+          { role: 'vendor', recipientName: String(vendor.shopName), trigger: 'vendor_verification_approved' }
+        );
+      }
+      const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [params.id], { consistent: true });
+      return json({ updated: true, verification: updated });
+    }
+
+    if (decision === 'rejected' && !reason) {
+      return fail('Provide a rejection reason so the vendor knows what to correct.');
+    }
+
+    const nextStatus = decision === 'rejected' ? 'rejected' : 'revoked';
+    const [okVer] = await db.tx.update('vendor_verifications', [{
+      id: params.id,
+      record: {
+        status: nextStatus,
+        rejectionReason: reason,
+        adminNotes,
+        reviewedAt: now,
+        reviewedBy: user!.userId,
+        updatedAt: now,
+      },
+    }], { patch: true });
+    const [okVendor] = await db.tx.update('vendors', [{
+      id: params.id,
+      record: {
+        isVerified: false,
+        verificationStatus: nextStatus,
+        updatedAt: now,
+      },
+    }], { patch: true });
+    if (!okVer || !okVendor) return fail('Could not update verification review status.', 500);
+
+    await notifyUser(
+      params.id,
+      decision === 'rejected' ? 'Shop verification needs updates' : 'Shop verification revoked',
+      reason || 'Your shop verification status was updated by marketplace operations.',
+      'vendor_verification',
+      '/'
+    );
+    const [updated] = await db.get<VendorVerificationRecord>('vendor_verifications', [params.id], { consistent: true });
+    return json({ updated: true, verification: updated });
+  }],
   'GET /api/admin/coupons': [...admin, async () => json({ coupons: await listAll<Record<string, unknown>>('coupons') })],
   'POST /api/admin/coupons': [...admin, async ({ user, body }) => {
     const b = body as Record<string, unknown>;
@@ -3810,7 +4861,12 @@ export const handler = router({
     if (manualPaystackConfirmation && confirmationNote.length < 8) return fail('Add a short audit note confirming that you checked the matching successful transaction in your Paystack dashboard.');
     let paymentGatewayFee = Number((existing as Record<string, unknown>).paymentGatewayFee || 0);
     let paymentGatewayFeeSource = String((existing as Record<string, unknown>).paymentGatewayFeeSource || '');
-    let paymentConfirmationMethod = existing.paymentMethod === 'Paystack' ? 'Paystack server verification' : 'Admin bank receipt confirmation';
+    let paymentConfirmationMethod =
+      existing.paymentMethod === 'Paystack'
+        ? 'Paystack server verification'
+        : existing.paymentMethod === 'Crypto'
+          ? 'Admin cryptocurrency receipt confirmation'
+          : 'Admin bank receipt confirmation';
     if (manualPaystackConfirmation) {
       const reference = String((existing as Record<string, unknown>).paystackReference || '').trim();
       if (!reference) return fail('This Paystack order has no transaction reference. It cannot be manually confirmed without a reference.');
@@ -3847,7 +4903,7 @@ export const handler = router({
       }
       paymentGatewayFee = Math.max(0, Number(payment.fees || 0) / 100);
       paymentGatewayFeeSource = 'Paystack verified transaction';
-    } else if (existing.paymentMethod !== 'Bank transfer') {
+    } else if (existing.paymentMethod !== 'Bank transfer' && existing.paymentMethod !== 'Crypto') {
       return fail('This payment method cannot be manually overridden here. Use its official verification process. The order remains unpaid.');
     }
     const completedAt = new Date().toISOString();
@@ -3856,7 +4912,9 @@ export const handler = router({
       paymentCompletedAt: completedAt,
       paymentConfirmedBy: user!.userId,
       paymentConfirmationMethod,
-      ...(existing.paymentMethod === 'Paystack' ? { paymentGatewayFee, paymentGatewayFeeSource, ...(manualPaystackConfirmation ? { paymentConfirmationNote: confirmationNote } : {}) } : { paymentGatewayFeeSource: 'Admin-confirmed manual bank transfer' })
+      ...(existing.paymentMethod === 'Paystack'
+        ? { paymentGatewayFee, paymentGatewayFeeSource, ...(manualPaystackConfirmation ? { paymentConfirmationNote: confirmationNote } : {}) }
+        : { paymentGatewayFeeSource: existing.paymentMethod === 'Crypto' ? 'Admin-confirmed crypto transfer' : 'Admin-confirmed manual bank transfer' })
     }, if: { paymentStatus: existing.paymentStatus } }], { patch: true });
     if (!paymentUpdated) {
       const [latest] = await db.get<OrderRecord>('orders', [params.id], { consistent: true });
@@ -3885,7 +4943,9 @@ export const handler = router({
         ? 'Admin confirmed receipt after checking the Paystack dashboard. Payment marked successful and notification emails were triggered.'
         : existing.paymentMethod === 'Paystack'
           ? 'Paystack payment verified successfully. Order marked as paid and notification emails were triggered.'
-          : 'Manual bank transfer confirmed by admin. Order marked as paid and notification emails were triggered.'
+          : existing.paymentMethod === 'Crypto'
+            ? 'Cryptocurrency payment confirmed by admin. Order marked as paid and notification emails were triggered.'
+            : 'Manual bank transfer confirmed by admin. Order marked as paid and notification emails were triggered.'
     });
   }],
   'GET /api/admin/email-status': [...admin, async () => {
@@ -4080,6 +5140,183 @@ export const handler = router({
     for (const row of rows) await db.tx.update('user_notifications', [{ id: String(row.id), record: { read: true, readAt: new Date().toISOString() } }], { patch: true });
     return json({ updated: rows.length });
   }],
+  'GET /api/announcements': [async ({ user }) => {
+    const uid = String(user?.userId || '').trim();
+    let vendorRecord: Record<string, unknown> | null = null;
+    let affiliateRecord: Record<string, unknown> | null = null;
+    let followedVendorIds: string[] = [];
+
+    if (uid) {
+      const [[v], [a], allFollows] = await Promise.all([
+        db.get<Record<string, unknown>>('vendors', [uid]),
+        db.get<Record<string, unknown>>('affiliates', [uid]),
+        listAll<Record<string, unknown>>('shop_follows'),
+      ]);
+      vendorRecord = v || null;
+      affiliateRecord = a || null;
+      followedVendorIds = allFollows
+        .filter((f) => String(f.userId || '') === uid)
+        .map((f) => String(f.vendorId || ''))
+        .filter(Boolean);
+    }
+
+    const viewer = buildAnnouncementViewerContext({
+      userId: uid || null,
+      vendorRecord,
+      affiliateRecord,
+      followedVendorIds,
+    });
+
+    const [allAnnouncements, allDismissals] = await Promise.all([
+      listAll<MarketplaceAnnouncement>('market_announcements'),
+      uid ? listAll<Record<string, unknown>>('announcement_dismissals') : Promise.resolve([]),
+    ]);
+
+    const dismissedIds = uid
+      ? allDismissals
+          .filter((row) => String(row.userId || '') === uid)
+          .map((row) => String(row.announcementId || ''))
+          .filter(Boolean)
+      : [];
+
+    const announcements = filterVisibleAnnouncements(allAnnouncements, viewer, dismissedIds).slice(0, 50);
+    return json({ announcements, dismissedIds, viewer });
+  }],
+  'POST /api/announcements/:id/dismiss': [requireAuth(), async ({ user, params }) => {
+    const announcementId = String(params.id || '').trim();
+    if (!announcementId) return fail('Announcement ID is required.');
+    const [existing] = await db.get<Record<string, unknown>>('market_announcements', [announcementId]);
+    if (!existing) return fail('Announcement not found.', 404);
+    const dismissalId = `${user!.userId}::${announcementId}`;
+    const [already] = await db.get<Record<string, unknown>>('announcement_dismissals', [dismissalId]);
+    if (!already) {
+      await db.tx.add('announcement_dismissals', [{
+        id: dismissalId,
+        userId: user!.userId,
+        announcementId,
+        dismissedAt: new Date().toISOString(),
+      }]);
+    }
+    return json({ dismissed: true, announcementId });
+  }],
+  'GET /api/vendor/announcements': [requireAuth(), async ({ user }) => {
+    const existing = await requireApprovedVendor({ user });
+    if (!existing) return fail('Your vendor shop must be approved before managing follower announcements.', 403);
+    const [allAnnouncements, allFollows] = await Promise.all([
+      listAll<Record<string, unknown>>('market_announcements'),
+      listAll<Record<string, unknown>>('shop_follows'),
+    ]);
+    const followerCount = computeVendorFollowerRecipients(allFollows, user!.userId).length;
+    const announcements = allAnnouncements
+      .filter((row) => String(row.vendorId || '') === user!.userId && String(row.audience || '') === 'shop_followers')
+      .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+      .slice(0, 60);
+    return json({ announcements, followerCount });
+  }],
+  'POST /api/vendor/announcements': [requireAuth(), async ({ user, body }) => {
+    const existing = await requireApprovedVendor({ user });
+    if (!existing) return fail('Your vendor shop must be approved before publishing announcements to shop followers.', 403);
+    const b = (body && typeof body === 'object' ? body : {}) as { title?: string; message?: string };
+    const title = String(b.title || '').trim();
+    const message = String(b.message || '').trim();
+    if (title.length < 2 || title.length > 120 || message.length < 2 || message.length > 1000) {
+      return fail('Enter a title (2–120 characters) and message (2–1,000 characters) for your followers.');
+    }
+    const allFollows = await listAll<Record<string, unknown>>('shop_follows');
+    const targets = computeVendorFollowerRecipients(allFollows, user!.userId);
+    const id = 'announcement-' + safeId();
+    const createdAt = new Date().toISOString();
+    const shopName = String(existing.shopName || 'Vendor Shop');
+    const [saved] = await db.tx.add('market_announcements', [{
+      id,
+      title,
+      message,
+      audience: 'shop_followers',
+      vendorId: user!.userId,
+      vendorShopName: shopName,
+      status: 'active',
+      sentCount: targets.length,
+      sentBy: user!.userId,
+      createdAt,
+    }]);
+    if (!saved) return fail('Could not publish follower announcement. Please try again.', 500);
+    let delivered = 0;
+    for (const recipientId of targets) {
+      try {
+        await notifyUser(recipientId, `${shopName}: ${title}`, message, 'announcement', '/shop/' + encodeURIComponent(user!.userId), {
+          announcementId: id,
+          audience: 'shop_followers',
+          vendorId: user!.userId,
+        });
+        delivered++;
+      } catch (e) {
+        console.error('Vendor announcement delivery failed for follower:', recipientId, e);
+      }
+    }
+    await db.tx.update('market_announcements', [{
+      id,
+      record: { deliveredCount: delivered, deliveryAttemptedAt: new Date().toISOString() },
+    }], { patch: true });
+    return json({
+      sent: delivered,
+      followerCount: targets.length,
+      announcement: {
+        id,
+        title,
+        message,
+        audience: 'shop_followers',
+        vendorId: user!.userId,
+        vendorShopName: shopName,
+        status: 'active',
+        sentCount: targets.length,
+        deliveredCount: delivered,
+        createdAt,
+      },
+      message: targets.length === 0
+        ? 'Announcement saved to the board for your future shop followers.'
+        : `Announcement published to the board and delivered to ${delivered} of ${targets.length} shop follower(s).`,
+    });
+  }],
+  'POST /api/vendor/announcements/:id/cancel': [requireAuth(), async ({ user, params }) => {
+    const existingVendor = await requireApprovedVendor({ user });
+    if (!existingVendor) return fail('Your vendor shop must be approved to manage announcements.', 403);
+    const announcementId = String(params.id || '').trim();
+    if (!announcementId) return fail('Announcement ID is required.');
+    const [existing] = await db.get<Record<string, unknown>>('market_announcements', [announcementId], { consistent: true });
+    if (!existing) return fail('Announcement not found.', 404);
+    if (String(existing.vendorId || '') !== user!.userId || String(existing.audience || '') !== 'shop_followers') {
+      return fail('You can only cancel your own shop follower announcements.', 403);
+    }
+    const now = new Date().toISOString();
+    if (String(existing.status || 'active').toLowerCase() !== 'cancelled') {
+      const [ok] = await db.tx.update('market_announcements', [{
+        id: announcementId,
+        record: { status: 'cancelled', cancelledAt: now, cancelledBy: user!.userId },
+      }], { patch: true });
+      if (!ok) return fail('Could not cancel announcement from board.', 500);
+    }
+    const allNotifications = await listAll<Record<string, unknown>>('user_notifications');
+    const matchingNotificationIds = allNotifications
+      .filter((row) =>
+        row.announcementId === announcementId ||
+        (row.kind === 'announcement' &&
+          row.vendorId === user!.userId &&
+          row.message === existing.message &&
+          String(row.createdAt || '') >= String(existing.createdAt || ''))
+      )
+      .map((row) => String(row.id || ''))
+      .filter(Boolean);
+    if (matchingNotificationIds.length) {
+      await db.delete('user_notifications', matchingNotificationIds);
+    }
+    const [updated] = await db.get<Record<string, unknown>>('market_announcements', [announcementId], { consistent: true });
+    return json({
+      cancelled: true,
+      removedNotifications: matchingNotificationIds.length,
+      announcement: updated || { ...existing, status: 'cancelled', cancelledAt: now, cancelledBy: user!.userId },
+      message: 'Shop follower announcement cancelled and removed from the board.',
+    });
+  }],
   'GET /api/admin/announcements': [...admin, async () => {
     const announcements = (await listAll<Record<string, unknown>>('market_announcements'))
       .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
@@ -4088,23 +5325,39 @@ export const handler = router({
   }],
   'POST /api/admin/announcements': [...admin, async ({ body, user }) => {
     const b = body as { title?: string; message?: string; audience?: string };
-    const title = String(b.title || '').trim(), message = String(b.message || '').trim(), audience = String(b.audience || 'all');
+    const title = String(b.title || '').trim();
+    const message = String(b.message || '').trim();
+    const audience = normalizeAdminAnnouncementAudience(b.audience || 'all');
     if (!title || title.length > 120 || !message || message.length > 1000) return fail('Enter a title and message within the character limits.');
-    if (!['all','customers','vendors'].includes(audience)) return fail('Choose a valid announcement audience.');
-    const vendors = await listAll<Record<string, unknown>>('vendors'), profiles = await listAll<Record<string, unknown>>('profiles');
-    const vendorIds = new Set(vendors.map(row => String(row.id)));
-    const ids = audience === 'vendors' ? [...vendorIds] : audience === 'customers' ? profiles.map(row => String(row.id)).filter(id => id && !vendorIds.has(id)) : [...new Set([...profiles.map(row => String(row.id)), ...vendorIds])];
-    const targets = [...new Set(ids.filter(Boolean))];
+    if (!audience) return fail('Choose a valid announcement audience (all, customers, vendors, or affiliates).');
+
+    const [vendors, profiles, affiliates] = await Promise.all([
+      listAll<Record<string, unknown>>('vendors'),
+      listAll<Record<string, unknown>>('profiles'),
+      listAll<Record<string, unknown>>('affiliates'),
+    ]);
+
+    const targets = computeAnnouncementRecipients({ audience, profiles, vendors, affiliates });
     const id = 'announcement-' + safeId();
     const createdAt = new Date().toISOString();
     const [saved] = await db.tx.add('market_announcements', [{
-      id, title, message, audience, sentCount: targets.length, sentBy: user!.userId, createdAt
+      id,
+      title,
+      message,
+      audience,
+      status: 'active',
+      sentCount: targets.length,
+      sentBy: user!.userId,
+      createdAt,
     }]);
     if (!saved) return fail('The announcement could not be saved. Please try again.', 500);
     let delivered = 0;
     for (const recipientId of targets) {
       try {
-        await notifyUser(recipientId, title, message, 'announcement', '/');
+        await notifyUser(recipientId, title, message, 'announcement', '/', {
+          announcementId: id,
+          audience,
+        });
         delivered++;
       } catch (e) {
         console.error('Announcement delivery failed for recipient:', recipientId, e);
@@ -4115,8 +5368,73 @@ export const handler = router({
     }], { patch: true });
     return json({
       sent: delivered,
-      announcement: { id, title, message, audience, sentCount: targets.length, deliveredCount: delivered, createdAt },
-      message: 'Announcement saved and delivered to ' + delivered + ' of ' + targets.length + ' registered account(s).'
+      announcement: { id, title, message, audience, status: 'active', sentCount: targets.length, deliveredCount: delivered, createdAt },
+      message: 'Announcement published to board and delivered to ' + delivered + ' of ' + targets.length + ' targeted account(s).'
+    });
+  }],
+  'POST /api/admin/announcements/:id/cancel': [...admin, async ({ params, user }) => {
+    const announcementId = String(params.id || '').trim();
+    if (!announcementId) return fail('Announcement ID is required.');
+    const [existing] = await db.get<Record<string, unknown>>('market_announcements', [announcementId], { consistent: true });
+    if (!existing) return fail('Announcement not found.', 404);
+    const now = new Date().toISOString();
+    if (String(existing.status || 'active').toLowerCase() !== 'cancelled') {
+      const [ok] = await db.tx.update('market_announcements', [{
+        id: announcementId,
+        record: { status: 'cancelled', cancelledAt: now, cancelledBy: user!.userId },
+      }], { patch: true });
+      if (!ok) return fail('Could not cancel announcement from board.', 500);
+    }
+    const allNotifications = await listAll<Record<string, unknown>>('user_notifications');
+    const matchingNotificationIds = allNotifications
+      .filter((row) =>
+        row.announcementId === announcementId ||
+        (row.kind === 'announcement' &&
+          row.title === existing.title &&
+          row.message === existing.message &&
+          String(row.createdAt || '') >= String(existing.createdAt || ''))
+      )
+      .map((row) => String(row.id || ''))
+      .filter(Boolean);
+    if (matchingNotificationIds.length) {
+      await db.delete('user_notifications', matchingNotificationIds);
+    }
+    const [updated] = await db.get<Record<string, unknown>>('market_announcements', [announcementId], { consistent: true });
+    return json({
+      cancelled: true,
+      removedNotifications: matchingNotificationIds.length,
+      announcement: updated || { ...existing, status: 'cancelled', cancelledAt: now, cancelledBy: user!.userId },
+      message: 'Announcement cancelled and removed from the marketplace board.',
+    });
+  }],
+  'DELETE /api/admin/announcements/:id': [...admin, async ({ params, user }) => {
+    const announcementId = String(params.id || '').trim();
+    if (!announcementId) return fail('Announcement ID is required.');
+    const [existing] = await db.get<Record<string, unknown>>('market_announcements', [announcementId], { consistent: true });
+    if (!existing) return fail('Announcement not found.', 404);
+    const now = new Date().toISOString();
+    await db.tx.update('market_announcements', [{
+      id: announcementId,
+      record: { status: 'cancelled', cancelledAt: now, cancelledBy: user!.userId },
+    }], { patch: true });
+    const allNotifications = await listAll<Record<string, unknown>>('user_notifications');
+    const matchingNotificationIds = allNotifications
+      .filter((row) =>
+        row.announcementId === announcementId ||
+        (row.kind === 'announcement' &&
+          row.title === existing.title &&
+          row.message === existing.message &&
+          String(row.createdAt || '') >= String(existing.createdAt || ''))
+      )
+      .map((row) => String(row.id || ''))
+      .filter(Boolean);
+    if (matchingNotificationIds.length) {
+      await db.delete('user_notifications', matchingNotificationIds);
+    }
+    return json({
+      cancelled: true,
+      removedNotifications: matchingNotificationIds.length,
+      message: 'Announcement cancelled and removed from the marketplace board.',
     });
   }],
   'GET /api/chat/conversations': [requireAuth(), async ({ user }) => {

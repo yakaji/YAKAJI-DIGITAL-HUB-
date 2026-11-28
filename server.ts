@@ -47,9 +47,13 @@ function compileRoutePattern(pattern: string) {
 
 const compiledRoutes = Object.keys(handler).map(compileRoutePattern);
 
-// Serve uploaded media stored via storage.write
+// Serve uploaded media stored via storage.write (excluding private KYC documents)
 app.use('/_storage', async (req, res) => {
   const rawKey = decodeURIComponent(req.path.replace(/^\/+/, ''));
+  if (!rawKey || rawKey.startsWith('vendor-kyc/') || rawKey.includes('/vendor-kyc/')) {
+    res.status(403).json({ error: 'Verification documents require authenticated access.', message: 'Verification documents require authenticated access.' });
+    return;
+  }
   const asset = await getStoredMedia(rawKey);
   if (!asset) {
     res.status(404).send('Media not found');
@@ -117,7 +121,7 @@ app.use(async (req, res, next) => {
               res.setHeader(hk, hv);
             }
           }
-          if (typeof result.body === 'string') {
+          if (Buffer.isBuffer(result.body) || typeof result.body === 'string') {
             res.status(status).send(result.body);
           } else {
             res.status(status).json(result.body);

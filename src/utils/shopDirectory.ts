@@ -20,6 +20,12 @@ export interface PublicShop {
   averageRating: number;
   reviewCount: number;
   isFollowed: boolean;
+  isVerified?: boolean;
+  verificationTier?: string;
+  verificationTierRank?: number;
+  badgeScope?: string;
+  verifiedAt?: string;
+  verifiedUntil?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -85,6 +91,9 @@ export function filterAndSortShops(
     if (sort === 'newest') {
       return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
     }
+    const rankA = a.isVerified && Number(a.verificationTierRank || 0) >= 3 ? Number(a.verificationTierRank) : 0;
+    const rankB = b.isVerified && Number(b.verificationTierRank || 0) >= 3 ? Number(b.verificationTierRank) : 0;
+    if (rankB !== rankA) return rankB - rankA;
     if (b.followerCount !== a.followerCount) return b.followerCount - a.followerCount;
     if (b.productCount !== a.productCount) return b.productCount - a.productCount;
     return a.shopName.localeCompare(b.shopName);

@@ -55,8 +55,23 @@ export interface AdminOrderDetailRecord {
   paymentStatus?: string;
   paymentNotificationSentAt?: string;
   paymentCompletedAt?: string;
+  paymentReviewedAt?: string;
+  paymentReviewNote?: string;
+  paymentRejectedAt?: string;
   paystackReference?: string;
   paymentReference?: string;
+  cryptoWalletId?: string;
+  cryptoCoin?: string;
+  cryptoSymbol?: string;
+  cryptoNetwork?: string;
+  cryptoAddress?: string;
+  cryptoInstructions?: string;
+  cryptoTxHash?: string;
+  cryptoTxSubmittedAt?: string;
+  cryptoUsdtRate?: number;
+  cryptoItemsUsdt?: number;
+  cryptoTransferFeeUsdt?: number;
+  cryptoTotalUsdt?: number;
   trackingNumber?: string;
   courier?: string;
   adminNote?: string;
@@ -88,13 +103,24 @@ export interface VendorOrderGroup {
   items: AdminOrderLineItem[];
 }
 
+export function computeOrderLineSubtotal(
+  item: Pick<AdminOrderLineItem, 'price' | 'quantity'>
+): number {
+  const unitPrice = Number(item.price);
+  const quantity = Number(item.quantity);
+  if (!Number.isFinite(unitPrice) || !Number.isFinite(quantity)) {
+    return 0;
+  }
+  return Math.max(0, unitPrice) * Math.max(0, quantity);
+}
+
 export function computeOrderFinancials(order: Pick<
   AdminOrderDetailRecord,
   'items' | 'subtotal' | 'couponCode' | 'couponDiscount' | 'transferFee' | 'paymentGatewayFee' | 'total'
 >): OrderFinancialSummary {
   const items = Array.isArray(order.items) ? order.items : [];
   const computedItemsSubtotal = items.reduce(
-    (sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0),
+    (sum, item) => sum + computeOrderLineSubtotal(item),
     0
   );
   const rawSubtotal = Number(order.subtotal);
@@ -139,7 +165,7 @@ export function groupOrderItemsByVendor(order: Pick<AdminOrderDetailRecord, 'ite
       items: [],
     };
     const qty = Math.max(0, Number(item.quantity || 0));
-    const lineTotal = Number(item.price || 0) * qty;
+    const lineTotal = computeOrderLineSubtotal(item);
     existing.subtotal += lineTotal;
     existing.itemCount += qty;
     existing.items.push(item);
@@ -184,9 +210,18 @@ export function formatOrderDetailsSummaryText(
     );
   }
   if (financials.transferFee > 0) {
-    lines.push(`Transfer Fee: ${formatMoney(financials.transferFee)}`);
+    lines.push(
+      order.paymentMethod === 'Crypto'
+        ? `Crypto Transfer Fee (${Number(order.cryptoTransferFeeUsdt ?? 1).toFixed(2)} USDT): ${formatMoney(financials.transferFee)}`
+        : `Transfer Fee: ${formatMoney(financials.transferFee)}`
+    );
   }
   lines.push(`Total: ${formatMoney(financials.total)}`);
+  if (order.paymentMethod === 'Crypto' && order.cryptoTotalUsdt) {
+    lines.push(
+      `Crypto Total Due: ${Number(order.cryptoTotalUsdt).toFixed(2)} USDT (Rate: 1 USDT = ${formatMoney(Number(order.cryptoUsdtRate || 1600))})`
+    );
+  }
 
   if (order.adminNote) {
     lines.push(`Admin Note: ${order.adminNote}`);

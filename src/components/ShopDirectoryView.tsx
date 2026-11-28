@@ -15,6 +15,7 @@ import {
   Store,
   Users,
 } from 'lucide-react';
+import { VerifiedShopBadge } from './VerifiedShopBadge';
 import {
   collectShopSpecialties,
   filterAndSortShops,
@@ -157,16 +158,16 @@ export function ShopDirectoryPage<T extends ShopProductLike>({
           <div className="page-banner-main">
             <span className="page-banner-icon"><Store size={24} /></span>
             <div>
-              <span className="eyebrow">VERIFIED STOREFRONTS · CURATED SELLERS</span>
+              <span className="eyebrow">MARKETPLACE STOREFRONTS · CURATED SELLERS</span>
               <h1>Vendor Shops &amp; Favorites</h1>
               <p>
-                Discover independent verified sellers, follow your favorite shops to build a curated shopping feed, and explore each vendor&apos;s storefront.
+                Discover independent sellers, look for the blue verified tick on KYC-verified shops, and follow your favorite storefronts.
               </p>
             </div>
           </div>
           <div className="page-banner-meta tabular-nums">
             <span className="page-banner-count">
-              {shops.length} verified shop{shops.length === 1 ? '' : 's'}
+              {shops.length} active shop{shops.length === 1 ? '' : 's'}
             </span>
             <span className="page-banner-count is-accent">
               <Heart size={13} fill={followedShopIds.length > 0 ? 'currentColor' : 'none'} />{' '}
@@ -186,7 +187,7 @@ export function ShopDirectoryPage<T extends ShopProductLike>({
               className={filterMode === 'all' ? 'active' : ''}
               onClick={() => setFilterMode('all')}
             >
-              All Verified Shops ({shops.length})
+              All Shops ({shops.length})
             </button>
             <button
               type="button"
@@ -283,12 +284,19 @@ export function ShopDirectoryPage<T extends ShopProductLike>({
                         className="shop-card-name"
                         onClick={() => onOpenShop(shop.id)}
                       >
-                        {shop.shopName}
+                        <span>{shop.shopName}</span>
+                        <VerifiedShopBadge
+                          verified={shop.isVerified}
+                          tierId={shop.verificationTier}
+                          size="sm"
+                        />
                       </h3>
                       {shop.tagline ? (
                         <p className="shop-card-tagline">{shop.tagline}</p>
                       ) : (
-                        <p className="shop-card-tagline">{shop.description || 'Verified Yakaji Digital Hub storefront'}</p>
+                        <p className="shop-card-tagline">
+                          {shop.description || 'Yakaji Digital Hub vendor storefront'}
+                        </p>
                       )}
                     </div>
                   </div>
@@ -307,6 +315,18 @@ export function ShopDirectoryPage<T extends ShopProductLike>({
                         <span className="shop-rating-inline">
                           <Star size={12} fill="currentColor" /> {shop.averageRating.toFixed(1)}
                         </span>
+                      </>
+                    )}
+                    {shop.isVerified && shop.verificationTier === 'pro_max' && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="shop-tier-spotlight">Featured Flagship</span>
+                      </>
+                    )}
+                    {shop.isVerified && shop.verificationTier === 'premium' && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="shop-tier-priority">Priority Verified</span>
                       </>
                     )}
                   </div>
@@ -478,9 +498,27 @@ export function ShopStorefrontPage<T extends ShopProductLike>({
               </div>
               <div className="shop-hero-copy">
                 <div className="shop-hero-eyebrow">
-                  <ShieldCheck size={14} /> Verified Independent Storefront
+                  {shop.isVerified ? (
+                    <VerifiedShopBadge
+                      verified
+                      tierId={shop.verificationTier}
+                      size="sm"
+                      showLabel
+                    />
+                  ) : (
+                    <>
+                      <ShieldCheck size={14} /> Approved Independent Storefront
+                    </>
+                  )}
                 </div>
-                <h1>{shop.shopName}</h1>
+                <h1 className="shop-title-verified-row">
+                  <span>{shop.shopName}</span>
+                  <VerifiedShopBadge
+                    verified={shop.isVerified}
+                    tierId={shop.verificationTier}
+                    size="lg"
+                  />
+                </h1>
                 {shop.tagline && <p className="shop-hero-tagline">{shop.tagline}</p>}
                 <div className="shop-hero-meta tabular-nums">
                   <span>{shop.specialty || 'Marketplace Seller'}</span>
@@ -530,6 +568,20 @@ export function ShopStorefrontPage<T extends ShopProductLike>({
             </div>
 
             <div className="shop-hero-info-cards">
+              {shop.isVerified && ['premium', 'pro_max'].includes(String(shop.verificationTier || '').toLowerCase()) && (
+                <div className="shop-info-tile shop-trust-tile">
+                  <small><ShieldCheck size={12} /> Verified Business Trust</small>
+                  <b>
+                    {shop.verificationTier === 'pro_max'
+                      ? 'Pro Max Flagship · CAC & National ID Audited'
+                      : 'Premium Merchant · CAC & National ID Audited'}
+                  </b>
+                  <span>
+                    Active verification reviewed by Yakaji Marketplace Compliance
+                    {shop.createdAt ? ` · Selling since ${new Date(shop.createdAt).getFullYear()}` : ''}
+                  </span>
+                </div>
+              )}
               {shop.phone && (
                 <div className="shop-info-tile">
                   <small><Phone size={12} /> Shop Contact</small>

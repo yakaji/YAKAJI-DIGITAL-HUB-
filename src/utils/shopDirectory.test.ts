@@ -134,3 +134,16 @@ test('collectShopSpecialties, formatShopLocation, getShopMonogram, and getFollow
     ['p1']
   );
 });
+
+test('filterAndSortShops elevates Premium and Pro Max shops in default popular sort', () => {
+  const rankedShops: PublicShop[] = [
+    { ...SHOPS[1], id: 'starter-high-follow', followerCount: 150, isVerified: true, verificationTier: 'starter', verificationTierRank: 1 },
+    { ...SHOPS[0], id: 'premium-shop', followerCount: 25, isVerified: true, verificationTier: 'premium', verificationTierRank: 3 },
+    { ...SHOPS[2], id: 'pro-max-shop', followerCount: 8, isVerified: true, verificationTier: 'pro_max', verificationTierRank: 4 },
+  ];
+  assert.deepEqual(
+    filterAndSortShops(rankedShops, { sort: 'popular' }).map((s) => s.id),
+    ['pro-max-shop', 'premium-shop', 'starter-high-follow']
+  );
+});
+

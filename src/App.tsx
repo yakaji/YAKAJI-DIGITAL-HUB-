@@ -25,14 +25,48 @@ import {
   toggleOrderSelection,
   toggleSelectAllVisibleOrders,
 } from './utils/bulkOrderActions';
-import { VendorDashboard, type VendorAccount, type VendorProfileFormState } from './components/VendorDashboard';
+import { VendorDashboard, type VendorAccount, type VendorProfileFormState, type VendorTab } from './components/VendorDashboard';
 import { AffiliateDashboard } from './components/AffiliateDashboard';
 import { OrderHistoryChart } from './components/OrderHistoryChart';
 import { ShopAvatar, ShopDirectoryPage, ShopStorefrontPage } from './components/ShopDirectoryView';
-import type { PublicShop } from './utils/shopDirectory';
+import { VerifiedShopBadge } from './components/VerifiedShopBadge';
+import { AdminVerificationQueue, type AdminVerificationRow } from './components/AdminVerificationQueue';
+import { filterAndSortShops, type PublicShop } from './utils/shopDirectory';
+import {
+  getEntitlementsForPlan,
+  getVendorEntitlements,
+  isVendorVerificationActive,
+  type VendorVerificationKycPayload,
+  type VendorVerificationRecord,
+  type VerificationBillingCycle,
+  type VerificationPaymentMethod,
+  type VerificationTierId,
+} from './utils/vendorVerification';
+import { AnnouncementBoard } from './components/AnnouncementBoard';
+import { AdminCryptoPanel } from './components/AdminCryptoPanel';
+import { CryptoTxVerificationTracker } from './components/CryptoTxVerificationTracker';
+import {
+  DEFAULT_CRYPTO_SETTINGS,
+  DEFAULT_CRYPTO_TRANSFER_FEE_USDT,
+  DEFAULT_USDT_NGN_RATE,
+  calculateCryptoCheckoutBreakdown,
+  convertNgnToUsdt,
+  formatUsdt,
+  getActiveCryptoWallets,
+  normalizeCryptoSettings,
+  sanitizeCryptoSettingsForPublic,
+  type CryptoSettings,
+  type PublicCryptoSettings,
+} from './utils/cryptoPayments';
+import {
+  ANNOUNCEMENT_AUDIENCE_OPTIONS,
+  formatAnnouncementAudienceLabel,
+  isAnnouncementActive,
+  type MarketplaceAnnouncement,
+} from './utils/announcements';
 import {
   ArrowLeft, ArrowRight, Award, BarChart3, Bell, Briefcase, Calendar, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
-  Code2, Copy, Download, Droplets, Eye, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
+  Code2, Coins, Copy, Download, Droplets, Eye, GraduationCap, Headphones, Heart, History, Home, ImagePlus, Laptop, LayoutDashboard,
   Lock, LogIn, LogOut, Megaphone, Menu, MessageCircle, MessageSquare, Package,
   PlayCircle, Plus, Search, Share2, ShieldCheck, Shirt, ShoppingBag, Star, Store, Tag,
   Trash2, TrendingUp, Truck, UploadCloud, UserRound, Users, Utensils, Wallet, X, Zap
@@ -43,7 +77,7 @@ type Media = { path: string; url: string; type: 'image' | 'video' };
 type Product = {
   id: string; name: string; category: string; price: number; description: string;
   tag: string; images: string[]; videos: string[]; imagePaths?: string[]; videoPaths?: string[]; stock: number;
-  options: string[]; vendorId: string; vendorName: string; status: string; affiliateCommissionPercent?: number; marketplaceCommissionPercent?: number;
+  options: string[]; vendorId: string; vendorName: string; vendorVerified?: boolean; vendorVerificationTier?: string; vendorBadgeScope?: string; status: string; affiliateCommissionPercent?: number; marketplaceCommissionPercent?: number;
   standardPrice?: number; discountPrice?: number; discountPercent?: number; discountActive?: boolean; discountStartAt?: string; discountEndAt?: string;
   averageRating?: number; reviewCount?: number;
 };
@@ -159,6 +193,44 @@ function App() {
   const [chatBusy, setChatBusy] = useState(false);
   const [announcement, setAnnouncement] = useState({ title: '', message: '', audience: 'all' });
   const [announcementHistory, setAnnouncementHistory] = useState<any[]>([]);
+  const [marketAnnouncements, setMarketAnnouncements] = useState<MarketplaceAnnouncement[]>([]);
+  const [dismissedAnnouncementIds, setDismissedAnnouncementIds] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('yakaji-dismissed-announcements') || '[]');
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [dismissAnnouncementBusyId, setDismissAnnouncementBusyId] = useState('');
+  const [cancellingAnnouncementId, setCancellingAnnouncementId] = useState('');
+  const [vendorAnnouncements, setVendorAnnouncements] = useState<any[]>([]);
+  const [vendorFollowerCount, setVendorFollowerCount] = useState(0);
+  const [vendorAnnouncementForm, setVendorAnnouncementForm] = useState({ title: '', message: '' });
+  const [vendorAnnouncementBusy, setVendorAnnouncementBusy] = useState(false);
+  const [cancellingVendorAnnouncementId, setCancellingVendorAnnouncementId] = useState('');
+  const [cryptoSettings, setCryptoSettings] = useState<CryptoSettings>(DEFAULT_CRYPTO_SETTINGS);
+  const [publicCrypto, setPublicCrypto] = useState<PublicCryptoSettings>(DEFAULT_CRYPTO_SETTINGS);
+  const [cryptoSettingsBusy, setCryptoSettingsBusy] = useState(false);
+  const [cryptoRateSyncBusy, setCryptoRateSyncBusy] = useState(false);
+  const [submittingCryptoTxOrderId, setSubmittingCryptoTxOrderId] = useState('');
+  const [cryptoWalletId, setCryptoWalletId] = useState('');
+  const [cryptoTxHash, setCryptoTxHash] = useState('');
+  const [cryptoPaymentOrder, setCryptoPaymentOrder] = useState<{
+    orderNumber: string;
+    total: number;
+    coin: string;
+    symbol: string;
+    network: string;
+    address: string;
+    instructions?: string;
+    txHash?: string;
+    usdtNgnRate: number;
+    itemsUsdt: number;
+    transferFeeUsdt: number;
+    transferFeeNgn: number;
+    totalUsdt: number;
+  } | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
@@ -205,6 +277,13 @@ function App() {
   const [activeShopProducts, setActiveShopProducts] = useState<Product[]>([]);
   const [activeShopLoading, setActiveShopLoading] = useState(false);
   const [shopMediaBusy, setShopMediaBusy] = useState<'' | 'icon' | 'cover' | 'profile'>('');
+  const [vendorVerification, setVendorVerification] = useState<VendorVerificationRecord | null>(null);
+  const [vendorVerifyPaystackReady, setVendorVerifyPaystackReady] = useState(false);
+  const [vendorVerificationBusy, setVendorVerificationBusy] = useState(false);
+  const [vendorVerificationDocBusy, setVendorVerificationDocBusy] = useState<'' | 'cac' | 'national_id'>('');
+  const [vendorRequestedTab, setVendorRequestedTab] = useState<VendorTab | ''>('');
+  const [adminVerifications, setAdminVerifications] = useState<AdminVerificationRow[]>([]);
+  const [adminVerifyBusy, setAdminVerifyBusy] = useState(false);
   const [vendorProfileForm, setVendorProfileForm] = useState<VendorProfileFormState>({
     shopName: '',
     phone: '',
@@ -463,6 +542,7 @@ function App() {
       setActiveShopDetail(current =>
         current && current.id === shop.id ? { ...current, isFollowed: followed, followerCount } : current
       );
+      void loadMarketAnnouncements();
       flash(followed ? `You are now following ${shop.shopName}.` : `Unfollowed ${shop.shopName}.`);
     } catch (e) {
       setError(errorText(e));
@@ -482,11 +562,29 @@ function App() {
     }
   }
   function flash(message: string) { setNotice(message); window.setTimeout(() => setNotice(''), 4000); }
+  async function loadMarketAnnouncements() {
+    try {
+      const r = await api.get('/api/announcements');
+      const next = Array.isArray(r.data?.announcements)
+        ? (r.data.announcements as MarketplaceAnnouncement[])
+        : [];
+      setMarketAnnouncements(next);
+      if (Array.isArray(r.data?.dismissedIds) && r.data.dismissedIds.length) {
+        setDismissedAnnouncementIds((current) => {
+          const merged = [...new Set([...current, ...r.data.dismissedIds.map(String)])];
+          localStorage.setItem('yakaji-dismissed-announcements', JSON.stringify(merged));
+          return merged;
+        });
+      }
+    } catch {
+      /* announcement board is optional on offline startup */
+    }
+  }
   async function loadNotifications() {
     if (!user) return;
     try { const r = await api.get('/api/notifications'); setUserNotifications(r.data.notifications || []); setUnreadNotifications(Number(r.data.unreadCount || 0)); } catch { /* optional account feature */ }
   }
-  async function openNotifications() { if (!user) { await signIn(); return; } await loadNotifications(); setNotificationsOpen(true); }
+  async function openNotifications() { if (!user) { await signIn(); return; } await Promise.all([loadNotifications(), loadMarketAnnouncements()]); setNotificationsOpen(true); }
   async function openNotificationTarget(notification: any) {
     const id = String(notification.id || '');
     if (id) await markNotificationRead(id);
@@ -570,10 +668,56 @@ function App() {
     try {
       const r = await api.post('/api/admin/announcements', announcement);
       setAnnouncementHistory(current => [r.data.announcement, ...current].filter(Boolean).slice(0, 100));
-      flash(r.data.message || 'Announcement sent.');
+      flash(r.data.message || 'Announcement published.');
       setAnnouncement({ title: '', message: '', audience: 'all' });
+      void loadMarketAnnouncements();
+      void loadNotifications();
     }
     catch (e) { setError(errorText(e)); } finally { setBusy(false); }
+  }
+  async function cancelAdminAnnouncement(id: string) {
+    if (!id) return;
+    setCancellingAnnouncementId(id);
+    setError('');
+    try {
+      const r = await api.post('/api/admin/announcements/' + encodeURIComponent(id) + '/cancel', {});
+      const updated = r.data?.announcement;
+      setAnnouncementHistory((current) =>
+        current.map((item) =>
+          item.id === id
+            ? { ...(updated || item), status: 'cancelled', cancelledAt: updated?.cancelledAt || new Date().toISOString() }
+            : item
+        )
+      );
+      setMarketAnnouncements((current) => current.filter((item) => item.id !== id));
+      void loadMarketAnnouncements();
+      void loadNotifications();
+      flash(r.data?.message || 'Announcement cancelled from board.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setCancellingAnnouncementId('');
+    }
+  }
+  async function dismissBoardAnnouncement(id: string) {
+    if (!id) return;
+    setDismissedAnnouncementIds((current) => {
+      const next = current.includes(id) ? current : [...current, id];
+      localStorage.setItem('yakaji-dismissed-announcements', JSON.stringify(next));
+      return next;
+    });
+    setMarketAnnouncements((current) => current.filter((item) => item.id !== id));
+    if (user) {
+      setDismissAnnouncementBusyId(id);
+      try {
+        await api.post('/api/announcements/' + encodeURIComponent(id) + '/dismiss', {});
+      } catch {
+        /* local dismissal already persisted */
+      } finally {
+        setDismissAnnouncementBusyId('');
+      }
+    }
+    flash('Announcement removed from your board.');
   }
   async function loadProducts() {
     const r = await api.get('/api/products');
@@ -598,12 +742,66 @@ function App() {
       return current;
     } catch { setVendor(null); syncVendorProfileForm(null); return null; }
   }
+  async function loadVendorAnnouncements() {
+    if (!user) return;
+    try {
+      const r = await api.get('/api/vendor/announcements');
+      setVendorAnnouncements(Array.isArray(r.data?.announcements) ? r.data.announcements : []);
+      setVendorFollowerCount(Number(r.data?.followerCount || 0));
+    } catch {
+      /* optional until vendor is approved */
+    }
+  }
+  async function publishVendorAnnouncement(e: FormEvent) {
+    e.preventDefault();
+    setVendorAnnouncementBusy(true);
+    setError('');
+    try {
+      const r = await api.post('/api/vendor/announcements', vendorAnnouncementForm);
+      if (r.data?.announcement) {
+        setVendorAnnouncements((current) => [r.data.announcement, ...current].slice(0, 60));
+      }
+      if (typeof r.data?.followerCount === 'number') {
+        setVendorFollowerCount(r.data.followerCount);
+      }
+      setVendorAnnouncementForm({ title: '', message: '' });
+      flash(r.data?.message || 'Announcement published to your shop followers.');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setVendorAnnouncementBusy(false);
+    }
+  }
+  async function cancelVendorAnnouncement(id: string) {
+    if (!id) return;
+    setCancellingVendorAnnouncementId(id);
+    setError('');
+    try {
+      const r = await api.post('/api/vendor/announcements/' + encodeURIComponent(id) + '/cancel', {});
+      const updated = r.data?.announcement;
+      setVendorAnnouncements((current) =>
+        current.map((item) =>
+          item.id === id
+            ? { ...(updated || item), status: 'cancelled', cancelledAt: updated?.cancelledAt || new Date().toISOString() }
+            : item
+        )
+      );
+      void loadMarketAnnouncements();
+      flash(r.data?.message || 'Follower announcement cancelled from board.');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setCancellingVendorAnnouncementId('');
+    }
+  }
   async function loadVendorWorkspace() {
-    const [p, o, c, walletResult] = await Promise.all([
+    const [p, o, c, walletResult, verResult, vendorAnnResult] = await Promise.all([
       api.get('/api/vendor/products'),
       api.get('/api/vendor/orders'),
       api.get('/api/vendor/coupons'),
-      api.get('/api/vendor/wallet')
+      api.get('/api/vendor/wallet'),
+      api.get('/api/vendor/verification').catch(() => ({ data: null })),
+      api.get('/api/vendor/announcements').catch(() => ({ data: { announcements: [], followerCount: 0 } })),
     ]);
     const vendorProducts = Array.isArray(p.data?.products) ? p.data.products : [];
     setVendorCoupons(c.data?.coupons || []);
@@ -611,10 +809,37 @@ function App() {
     setOrders(o.data?.orders || []);
     setVendorReports(o.data?.summary || null);
     setWallet(walletResult.data || null);
+    setVendorAnnouncements(Array.isArray(vendorAnnResult?.data?.announcements) ? vendorAnnResult.data.announcements : []);
+    setVendorFollowerCount(Number(vendorAnnResult?.data?.followerCount || 0));
+    if (verResult?.data) {
+      setVendorVerification(verResult.data.verification || null);
+      setVendorVerifyPaystackReady(Boolean(verResult.data.paystackConfigured));
+      if (verResult.data.vendor) {
+        setVendor(verResult.data.vendor as Vendor);
+        syncVendorProfileForm(verResult.data.vendor as Vendor);
+      }
+    }
   }
   async function loadAdmin() {
     await api.post('/api/admin/products/affiliate-default', {});
-    const [v, o, p, a, s, w, u, t, c, af, announcements, mailStatus, secStatus, bkpRes] = await Promise.all([api.get('/api/admin/vendors'), api.get('/api/admin/orders'), api.get('/api/admin/products'), api.get('/api/admin/analytics'),api.get('/api/admin/settings'),api.get('/api/admin/withdrawals'),api.get('/api/admin/users'),api.get('/api/admin/wallet-topups'),api.get('/api/admin/coupons'),api.get('/api/admin/affiliates'),api.get('/api/admin/announcements'),api.get('/api/admin/email-status').catch(()=>({data:null})),api.get('/api/admin/security').catch(()=>({data:null})),api.get('/api/admin/backups').catch(()=>({data:null}))]);
+    const [v, o, p, a, s, w, u, t, c, af, announcements, mailStatus, secStatus, bkpRes, verRes, cryptoRes] = await Promise.all([
+      api.get('/api/admin/vendors'),
+      api.get('/api/admin/orders'),
+      api.get('/api/admin/products'),
+      api.get('/api/admin/analytics'),
+      api.get('/api/admin/settings'),
+      api.get('/api/admin/withdrawals'),
+      api.get('/api/admin/users'),
+      api.get('/api/admin/wallet-topups'),
+      api.get('/api/admin/coupons'),
+      api.get('/api/admin/affiliates'),
+      api.get('/api/admin/announcements'),
+      api.get('/api/admin/email-status').catch(()=>({data:null})),
+      api.get('/api/admin/security').catch(()=>({data:null})),
+      api.get('/api/admin/backups').catch(()=>({data:null})),
+      api.get('/api/admin/verifications').catch(()=>({data:{verifications:[]}})),
+      api.get('/api/admin/crypto-settings').catch(()=>({data:null})),
+    ]);
     setAdminCoupons(c.data?.coupons || []); setAffiliateData(af.data || {affiliates:[],commissions:[],withdrawals:[],summary:{}});
     setSettings(current => normalizeMarketSettings(s.data?.settings, current)); setWithdrawals(w.data?.withdrawals||[]); setAdminUsers(u.data?.users||[]); setWalletTopups(t.data?.topups||[]);
     setVendors(v.data?.vendors || []);
@@ -625,6 +850,10 @@ function App() {
     if (mailStatus?.data) setEmailStatus(mailStatus.data);
     if (secStatus?.data) setAdminSecurity(secStatus.data);
     if (bkpRes?.data?.backups) setAdminBackups(bkpRes.data.backups);
+    setAdminVerifications(verRes?.data?.verifications || []);
+    if (cryptoRes?.data?.crypto) {
+      setCryptoSettings(normalizeCryptoSettings(cryptoRes.data.crypto));
+    }
   }
 
   useEffect(() => {
@@ -639,14 +868,23 @@ function App() {
         const restored = await auth.getUser();
         if (!active) return;
         setUser(restored);
-        const [r, s, sh] = await Promise.all([
+        const [r, s, sh, ann] = await Promise.all([
           api.get('/api/products'),
           api.get('/api/settings/public'),
           api.get('/api/shops').catch(() => ({ data: { shops: [], followedShopIds: [] } })),
+          api.get('/api/announcements').catch(() => ({ data: { announcements: [], dismissedIds: [] } })),
         ]);
         if (active) {
           setProducts(r.data?.products || []);
           setSettings(current => normalizeMarketSettings(s.data?.settings, current));
+          if (s.data?.crypto) {
+            const normalizedCrypto = normalizeCryptoSettings(s.data.crypto);
+            setPublicCrypto(normalizedCrypto);
+            const activeWallets = getActiveCryptoWallets(normalizedCrypto);
+            if (activeWallets.length) {
+              setCryptoWalletId((curr) => curr && activeWallets.some((w) => w.id === curr) ? curr : activeWallets[0].id);
+            }
+          }
           const loadedShops = Array.isArray(sh.data?.shops) ? (sh.data.shops as PublicShop[]) : [];
           setShops(loadedShops);
           setFollowedShopIds(
@@ -654,6 +892,14 @@ function App() {
               ? (sh.data.followedShopIds as string[])
               : loadedShops.filter(item => item.isFollowed).map(item => item.id)
           );
+          setMarketAnnouncements(Array.isArray(ann.data?.announcements) ? ann.data.announcements : []);
+          if (Array.isArray(ann.data?.dismissedIds) && ann.data.dismissedIds.length) {
+            setDismissedAnnouncementIds((current) => {
+              const merged = [...new Set([...current, ...ann.data.dismissedIds.map(String)])];
+              localStorage.setItem('yakaji-dismissed-announcements', JSON.stringify(merged));
+              return merged;
+            });
+          }
         }
         if (restored) {
           try {
@@ -687,6 +933,20 @@ function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (params.get('vendor_verify') === 'paystack') {
+      if (!user) return;
+      const reference = params.get('reference') || params.get('trxref');
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      setVendorRequestedTab('verification');
+      setPage('vendor');
+      if (!reference) { setError('Paystack returned without a verification payment reference. Please check status in Verification Centre.'); return; }
+      api.post('/api/vendor/verification/paystack/verify', { reference }).then(async r => {
+        setVendorVerification(r.data?.verification || null);
+        await Promise.all([loadVendor(), loadVendorWorkspace()]);
+        flash('Verification payment confirmed! Now attach your Business CAC, National ID card, and owner details.');
+      }).catch(e => setError(errorText(e)));
+      return;
+    }
     if (params.get('wallet') === 'paystack') {
       if (!user) return;
       const reference = params.get('reference') || params.get('trxref');
@@ -775,8 +1035,15 @@ function App() {
   useEffect(() => {
     if (!user) { setUserNotifications([]); setUnreadNotifications(0); return; }
     void loadNotifications();
-    const timer = window.setInterval(() => { void loadNotifications(); }, 20000);
-    const off = notifications.onMessage(() => { void loadNotifications(); });
+    void loadMarketAnnouncements();
+    const timer = window.setInterval(() => {
+      void loadNotifications();
+      void loadMarketAnnouncements();
+    }, 20000);
+    const off = notifications.onMessage(() => {
+      void loadNotifications();
+      void loadMarketAnnouncements();
+    });
     return () => { window.clearInterval(timer); off(); };
   }, [user]);
   useEffect(() => {
@@ -973,6 +1240,14 @@ function App() {
     return () => window.removeEventListener('popstate', applyPath);
   }, []);
 
+  const visibleMarketAnnouncements = useMemo(
+    () =>
+      marketAnnouncements.filter(
+        (item) => isAnnouncementActive(item) && !dismissedAnnouncementIds.includes(String(item.id))
+      ),
+    [marketAnnouncements, dismissedAnnouncementIds]
+  );
+
   const activeCategoryMeta = useMemo(() => resolveCategoryMeta(activeCategorySlug), [activeCategorySlug]);
   const approvedProducts = useMemo(() => products.filter(p => p.status === 'approved'), [products]);
   const homeTrendingProducts = useMemo(() => {
@@ -1163,8 +1438,29 @@ function App() {
   const cartSubtotal = cart.reduce((sum, line) => sum + line.product.price * line.quantity, 0);
   const couponSavings = Math.min(cartSubtotal, Number(appliedCoupon?.discount || 0));
   const transferFee = Number(settings?.customerTransferFee ?? 100);
-  const cartTotal = Math.max(0, cartSubtotal - couponSavings) + (customer.paymentMethod === 'Bank transfer' ? transferFee : 0);
+  const activeUsdtRate = Number(publicCrypto.usdtNgnRate) || DEFAULT_USDT_NGN_RATE;
+  const activeCryptoFeeUsdt =
+    publicCrypto.transferFeeUsdt === undefined
+      ? DEFAULT_CRYPTO_TRANSFER_FEE_USDT
+      : Number(publicCrypto.transferFeeUsdt);
+  const usdtText = (ngn: number) => formatUsdt(convertNgnToUsdt(ngn, activeUsdtRate));
+  const cryptoBreakdown = calculateCryptoCheckoutBreakdown({
+    ngnSubtotal: cartSubtotal,
+    couponDiscount: couponSavings,
+    usdtNgnRate: activeUsdtRate,
+    transferFeeUsdt: activeCryptoFeeUsdt,
+  });
+  const cartTotal =
+    customer.paymentMethod === 'Crypto'
+      ? cryptoBreakdown.totalNgn
+      : Math.max(0, cartSubtotal - couponSavings) +
+        (customer.paymentMethod === 'Bank transfer' ? transferFee : 0);
   const cartCount = cart.reduce((sum, line) => sum + line.quantity, 0);
+  const activeCryptoWallets = useMemo(() => getActiveCryptoWallets(publicCrypto), [publicCrypto]);
+  const selectedCheckoutCryptoWallet = useMemo(
+    () => activeCryptoWallets.find((w) => w.id === cryptoWalletId) || activeCryptoWallets[0] || null,
+    [activeCryptoWallets, cryptoWalletId]
+  );
   const dailyTrend = adminAnalytics?.dailyTrend || [];
   const monthlyTrend = adminAnalytics?.monthlyTrend || [];
   const orderStatuses = adminAnalytics?.orderStatuses || [];
@@ -1191,6 +1487,7 @@ function App() {
       setVendor(nextVendor);
       syncVendorProfileForm(nextVendor);
       void loadShops();
+      void loadMarketAnnouncements();
     } catch { /* profile or vendor optional */ }
   }
 
@@ -1244,6 +1541,7 @@ function App() {
     setAdminSecurity(null);
     setPage('home');
     if (window.location.pathname.startsWith('/admin')) pushCleanPath('/');
+    void loadMarketAnnouncements();
     flash('You have signed out.');
   }
   function addToCart(product: Product, optionOverride?: string, quantityToAdd = 1) {
@@ -1258,17 +1556,26 @@ function App() {
   async function placeOrder(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try {
+      if (customer.paymentMethod === 'Crypto' && (!publicCrypto.enabled || !selectedCheckoutCryptoWallet)) {
+        throw new Error('Select an active cryptocurrency wallet network before placing your order.');
+      }
       const orderPayload = {
         customerName: customer.name, phone: customer.phone, email: customer.email.trim(),
         address: customer.address,
         couponCode: appliedCoupon?.code || '',
         referralCode: localStorage.getItem('yakaji-affiliate-ref') || '',
-        items: cart.map(x => ({ productId: x.product.id, quantity: x.quantity, option: x.option }))
+        items: cart.map(x => ({ productId: x.product.id, quantity: x.quantity, option: x.option })),
+        ...(customer.paymentMethod === 'Crypto' && selectedCheckoutCryptoWallet
+          ? {
+              cryptoWalletId: selectedCheckoutCryptoWallet.id,
+              cryptoTxHash: cryptoTxHash.trim(),
+            }
+          : {}),
       };
       const r = customer.paymentMethod === 'Wallet'
         ? await api.post('/api/orders/wallet', orderPayload)
         : await api.post('/api/orders', { ...orderPayload, paymentMethod: customer.paymentMethod });
-      setCart([]); setCheckoutOpen(false); setCouponCode(''); setAppliedCoupon(null);
+      setCart([]); setCheckoutOpen(false); setCouponCode(''); setAppliedCoupon(null); setCryptoTxHash('');
       setCustomer({ name: '', phone: '', email: '', address: '', paymentMethod: 'Paystack' });
       if (customer.paymentMethod === 'Paystack' && r.data.authorizationUrl) {
         window.location.href = r.data.authorizationUrl;
@@ -1276,6 +1583,22 @@ function App() {
       }
       if (customer.paymentMethod === 'Bank transfer') {
         setManualTransferOrder({ orderNumber: r.data.orderNumber, total: Number(r.data.total || 0) });
+      } else if (customer.paymentMethod === 'Crypto' && r.data?.cryptoPayment) {
+        setCryptoPaymentOrder({
+          orderNumber: String(r.data.orderNumber || ''),
+          total: Number(r.data.total || 0),
+          coin: String(r.data.cryptoPayment.coin || ''),
+          symbol: String(r.data.cryptoPayment.symbol || ''),
+          network: String(r.data.cryptoPayment.network || ''),
+          address: String(r.data.cryptoPayment.address || ''),
+          instructions: String(r.data.cryptoPayment.instructions || publicCrypto.checkoutNote || ''),
+          txHash: String(r.data.cryptoPayment.txHash || ''),
+          usdtNgnRate: Number(r.data.cryptoPayment.usdtNgnRate || activeUsdtRate),
+          itemsUsdt: Number(r.data.cryptoPayment.itemsUsdt || 0),
+          transferFeeUsdt: Number(r.data.cryptoPayment.transferFeeUsdt ?? activeCryptoFeeUsdt),
+          transferFeeNgn: Number(r.data.cryptoPayment.transferFeeNgn || 0),
+          totalUsdt: Number(r.data.cryptoPayment.totalUsdt || 0),
+        });
       } else if (customer.paymentMethod === 'Wallet') {
         const [w, history] = await Promise.all([api.get('/api/wallet'), api.get('/api/customer/orders')]);
         setWalletSummary(w.data); setCustomerOrders(history.data.orders || []);
@@ -1392,6 +1715,25 @@ function App() {
     if (!window.confirm('Cancel unpaid order ' + order.orderNumber + '?')) return;
     try { await api.put('/api/customer/orders/' + order.id + '/cancel', {}); await loadCustomerOrders(); flash('Your unpaid order has been cancelled.'); }
     catch (e) { setError(errorText(e)); }
+  }
+  async function submitCustomerCryptoTxHash(orderId: string, txHash: string) {
+    setSubmittingCryptoTxOrderId(orderId);
+    setError('');
+    try {
+      const r = await api.put('/api/customer/orders/' + encodeURIComponent(orderId) + '/crypto-tx-hash', {
+        cryptoTxHash: txHash,
+      });
+      if (r.data?.order) {
+        setCustomerOrders((prev) => prev.map((item) => (item.id === orderId ? { ...item, ...r.data.order } : item)));
+      } else {
+        await loadCustomerOrders();
+      }
+      flash(r.data?.message || 'Transaction hash submitted for verification.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setSubmittingCryptoTxOrderId('');
+    }
   }
   async function sendSupportMessage(e: FormEvent) {
     e.preventDefault(); if (!supportDraft.trim() || !supportConversation) return;
@@ -1733,9 +2075,139 @@ function App() {
       setShopMediaBusy('');
     }
   }
-  function startNewProduct() { setDraft(blankDraft); setSelectedFiles([]); setEditing(false); }
+  async function refreshVendorVerification() {
+    setVendorVerificationBusy(true);
+    setError('');
+    try {
+      const r = await api.get('/api/vendor/verification');
+      setVendorVerification(r.data?.verification || null);
+      setVendorVerifyPaystackReady(Boolean(r.data?.paystackConfigured));
+      if (r.data?.vendor) {
+        setVendor(r.data.vendor as Vendor);
+        syncVendorProfileForm(r.data.vendor as Vendor);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setVendorVerificationBusy(false);
+    }
+  }
+  async function startVendorVerificationPayment(payload: {
+    tierId: VerificationTierId;
+    billingCycle: VerificationBillingCycle;
+    paymentMethod: VerificationPaymentMethod;
+  }) {
+    setVendorVerificationBusy(true);
+    setError('');
+    try {
+      const r = await api.post('/api/vendor/verification/payment', payload);
+      if (r.data?.verification) setVendorVerification(r.data.verification);
+      if (r.data?.authorizationUrl) {
+        window.location.href = r.data.authorizationUrl;
+        return r.data;
+      }
+      await Promise.all([loadVendor(), loadVendorWorkspace()]);
+      if (payload.paymentMethod === 'Wallet') {
+        flash('Verification payment confirmed! Now attach your Business CAC and National ID in Step 2.');
+      } else {
+        flash('Bank transfer details generated. Once admin confirms your transfer, Step 2 unlocks.');
+      }
+      return r.data;
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setVendorVerificationBusy(false);
+    }
+  }
+  async function verifyVendorPaystack(reference: string) {
+    setVendorVerificationBusy(true);
+    setError('');
+    try {
+      const r = await api.post('/api/vendor/verification/paystack/verify', { reference });
+      if (r.data?.verification) setVendorVerification(r.data.verification);
+      await Promise.all([loadVendor(), loadVendorWorkspace()]);
+      flash('Paystack verification payment confirmed! Step 2 is now unlocked.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setVendorVerificationBusy(false);
+    }
+  }
+  async function uploadVendorVerificationDocument(kind: 'cac' | 'national_id', file: File) {
+    const allowedMime = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf'];
+    if (!allowedMime.includes(file.type.toLowerCase())) {
+      setError('Upload a valid PNG, JPG, WebP image or PDF document.');
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setError('Verification documents must be 8MB or smaller.');
+      return;
+    }
+    setVendorVerificationDocBusy(kind);
+    setError('');
+    try {
+      const base64 = await fileToBase64(file);
+      const r = await api.post('/api/vendor/verification/document', {
+        kind,
+        fileName: file.name,
+        contentType: file.type,
+        base64,
+      });
+      if (r.data?.verification) setVendorVerification(r.data.verification);
+      flash(kind === 'cac' ? 'Business CAC document attached.' : 'National ID card attached.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setVendorVerificationDocBusy('');
+    }
+  }
+  async function submitVendorVerificationKyc(payload: VendorVerificationKycPayload) {
+    setVendorVerificationBusy(true);
+    setError('');
+    try {
+      const r = await api.post('/api/vendor/verification/submit', payload);
+      if (r.data?.verification) setVendorVerification(r.data.verification);
+      await loadVendor();
+      flash(r.data?.message || 'Verification details submitted for admin approval.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setVendorVerificationBusy(false);
+    }
+  }
+  function startNewProduct() {
+    const ent = getVendorEntitlements(vendor);
+    setDraft({
+      ...blankDraft,
+      affiliateCommissionPercent: !isAdmin && ent.maxAffiliateCommissionPercent === 0 ? '0' : '5',
+    });
+    setSelectedFiles([]);
+    setEditing(false);
+  }
   function startEdit(p: Product) {
-    setDraft({ id: p.id, name: p.name, category: p.category, price: String(p.standardPrice ?? p.price), description: p.description, stock: String(p.stock), tag: p.tag, options: p.options.join(', '), images: p.imagePaths || [], videos: p.videoPaths || [], affiliateCommissionPercent: String(Number(p.affiliateCommissionPercent ?? 0) >= 5 ? p.affiliateCommissionPercent : 5), marketplaceCommissionPercent: p.marketplaceCommissionPercent === undefined ? '' : String(p.marketplaceCommissionPercent), discountMode: p.discountPrice ? 'manual' : 'none', discountValue: p.discountPrice ? String(p.discountPrice) : '', discountStartAt: p.discountStartAt ? new Date(p.discountStartAt).toISOString().slice(0,16) : '', discountEndAt: p.discountEndAt ? new Date(p.discountEndAt).toISOString().slice(0,16) : '' });
+    const ent = getVendorEntitlements(vendor);
+    const existingAffiliate = Number(p.affiliateCommissionPercent ?? 0);
+    const initialAffiliate = !isAdmin && ent.maxAffiliateCommissionPercent === 0
+      ? String(existingAffiliate)
+      : String(existingAffiliate >= 5 ? existingAffiliate : 5);
+    setDraft({
+      id: p.id,
+      name: p.name,
+      category: p.category,
+      price: String(p.standardPrice ?? p.price),
+      description: p.description,
+      stock: String(p.stock),
+      tag: p.tag,
+      options: p.options.join(', '),
+      images: p.imagePaths || [],
+      videos: p.videoPaths || [],
+      affiliateCommissionPercent: initialAffiliate,
+      marketplaceCommissionPercent: p.marketplaceCommissionPercent === undefined ? '' : String(p.marketplaceCommissionPercent),
+      discountMode: p.discountPrice ? 'manual' : 'none',
+      discountValue: p.discountPrice ? String(p.discountPrice) : '',
+      discountStartAt: p.discountStartAt ? new Date(p.discountStartAt).toISOString().slice(0, 16) : '',
+      discountEndAt: p.discountEndAt ? new Date(p.discountEndAt).toISOString().slice(0, 16) : '',
+    });
     setSelectedFiles([]); setEditing(true);
     document.getElementById('product-editor')?.scrollIntoView({ behavior: 'smooth' });
   }
@@ -1754,6 +2226,12 @@ function App() {
   async function saveProduct(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try {
+      if (!isAdmin) {
+        const ent = getVendorEntitlements(vendor);
+        if (!ent.allowProductVideos && selectedFiles.some((f) => f.type.startsWith('video/'))) {
+          throw new Error(`Product promo videos are not included in ${ent.planName}. Upgrade to Plus, Premium, or Pro Max.`);
+        }
+      }
       const media = await uploadMedia();
       const standardPrice = Number(draft.price);
       const discountPrice = draft.discountMode === 'manual'
@@ -1914,6 +2392,47 @@ function App() {
     } catch (e) { setError(errorText(e)); }
   }
   async function saveSettings(){try{const r=await api.put('/api/admin/settings',settings);setSettings(current => normalizeMarketSettings(r.data?.settings, current));flash('Marketplace fees and commission saved.');}catch(e){setError(errorText(e));}}
+  async function saveAdminCryptoSettings(nextSettings: CryptoSettings) {
+    setCryptoSettingsBusy(true);
+    setError('');
+    try {
+      const r = await api.put('/api/admin/crypto-settings', nextSettings);
+      const saved = normalizeCryptoSettings(r.data?.crypto || nextSettings);
+      setCryptoSettings(saved);
+      setPublicCrypto(sanitizeCryptoSettingsForPublic(saved));
+      const active = getActiveCryptoWallets(saved);
+      if (active.length) {
+        setCryptoWalletId((curr) => (curr && active.some((w) => w.id === curr) ? curr : active[0].id));
+      } else {
+        setCryptoWalletId('');
+      }
+      flash(r.data?.message || 'Cryptocurrency checkout methods saved and published.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setCryptoSettingsBusy(false);
+    }
+  }
+  async function syncAdminGoogleCryptoRate(enableAutoSync: boolean = true) {
+    setCryptoRateSyncBusy(true);
+    setError('');
+    try {
+      const r = await api.post('/api/admin/crypto-settings/sync-google-rate', {
+        enableAutoSync,
+        enabled: cryptoSettings.enabled,
+        transferFeeUsdt: cryptoSettings.transferFeeUsdt,
+        checkoutNote: cryptoSettings.checkoutNote,
+      });
+      const saved = normalizeCryptoSettings(r.data?.crypto || cryptoSettings);
+      setCryptoSettings(saved);
+      setPublicCrypto(sanitizeCryptoSettingsForPublic(saved));
+      flash(r.data?.message || `Live USDT rate synced: 1 USDT = ₦${saved.usdtNgnRate.toLocaleString('en-NG')}.`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setCryptoRateSyncBusy(false);
+    }
+  }
   async function saveAdminPassword(e: FormEvent) {
     e.preventDefault();
     setError('');
@@ -1992,6 +2511,41 @@ function App() {
   async function approveVendor(id: string, status: string) {
     try { await api.put('/api/admin/vendors/' + id, { status }); await loadAdmin(); flash('Vendor status updated.'); }
     catch (e) { setError(errorText(e)); }
+  }
+  async function confirmAdminVerificationTransfer(vendorId: string) {
+    setAdminVerifyBusy(true);
+    setError('');
+    try {
+      await api.post('/api/admin/verifications/' + encodeURIComponent(vendorId) + '/confirm-transfer', {});
+      await loadAdmin();
+      flash('Verification bank transfer confirmed. Vendor can now attach CAC & National ID.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setAdminVerifyBusy(false);
+    }
+  }
+  async function reviewAdminVerification(vendorId: string, decision: 'approved' | 'rejected' | 'revoked', reason?: string) {
+    setAdminVerifyBusy(true);
+    setError('');
+    try {
+      await api.put('/api/admin/verifications/' + encodeURIComponent(vendorId) + '/review', {
+        decision,
+        reason: reason || '',
+      });
+      await Promise.all([loadAdmin(), loadProducts(), loadShops()]);
+      flash(
+        decision === 'approved'
+          ? 'Shop verification approved — Blue Verified Tick is now live.'
+          : decision === 'rejected'
+            ? 'Verification rejected with reason sent to vendor.'
+            : 'Shop verification badge revoked.'
+      );
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setAdminVerifyBusy(false);
+    }
   }
   async function approveProduct(id: string, status: string) {
     try { await api.put('/api/admin/products/' + id + '/review', { status }); await loadAdmin(); flash('Product review status updated.'); }
@@ -2159,28 +2713,40 @@ function App() {
         <div className="product-meta-line">
           <span className="product-meta-cat">{p.category}</span>
           <span aria-hidden="true">·</span>
-          {shops.some(s => s.id === p.vendorId) ? (
-            <button
-              type="button"
-              className="product-shop-link"
-              onClick={(e) => {
-                e.stopPropagation();
-                openPublicShop(p.vendorId);
-              }}
-            >
-              {p.vendorName || 'Yakaji Hub'}
-            </button>
-          ) : (
-            <span>{p.vendorName || 'Yakaji Hub'}</span>
-          )}
+          {(() => {
+            const cardShop = shops.find(s => s.id === p.vendorId);
+            const isVerifiedVendor = Boolean(p.vendorVerified || cardShop?.isVerified);
+            const tier = p.vendorVerificationTier || cardShop?.verificationTier;
+            const badgeScope = p.vendorBadgeScope || cardShop?.badgeScope || (tier ? getEntitlementsForPlan(tier).badgeScope : 'none');
+            const showProductTick = isVerifiedVendor && badgeScope !== 'shop' && badgeScope !== 'none';
+            return cardShop ? (
+              <button
+                type="button"
+                className="product-shop-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openPublicShop(p.vendorId);
+                }}
+              >
+                <span>{p.vendorName || 'Yakaji Hub'}</span>
+                <VerifiedShopBadge verified={showProductTick} tierId={tier} size="xs" />
+              </button>
+            ) : (
+              <span className="shop-inline-verified">
+                <span>{p.vendorName || 'Yakaji Hub'}</span>
+                <VerifiedShopBadge verified={showProductTick} tierId={tier} size="xs" />
+              </span>
+            );
+          })()}
         </div>
         <h3>{p.name}</h3>
         {rating > 0 && <small className="product-rating-line"><Star size={13} fill="currentColor"/> {rating.toFixed(1)} <span>({reviewsTotal})</span></small>}
         <div className="product-foot">
-          {p.discountActive ? <span className="sale-prices">
+          {p.discountActive ? <span className="sale-prices tabular-nums">
             <span className="sale-prices-top"><del>{money(p.standardPrice || p.price)}</del><small>-{p.discountPercent}%</small></span>
             <strong>{money(p.price)}</strong>
-          </span> : <b>{money(p.price)}</b>}
+            <small className="price-usdt-line">≈ {usdtText(p.price)}</small>
+          </span> : <div className="product-price-stack tabular-nums"><b>{money(p.price)}</b><small className="price-usdt-line">≈ {usdtText(p.price)}</small></div>}
           <button disabled={p.stock < 1} onClick={e => { e.stopPropagation(); addToCart(p); }}>
             <Plus size={15}/> {p.stock < 1 ? 'Sold out' : 'Add'}
           </button>
@@ -2340,6 +2906,17 @@ function App() {
         </div>}
       </aside>
     </div>}
+
+    {page !== 'admin' && page !== 'admin-history' && visibleMarketAnnouncements.length > 0 && (
+      <div className="ydh-container announcement-board-wrap">
+        <AnnouncementBoard
+          announcements={visibleMarketAnnouncements}
+          onDismiss={(id) => void dismissBoardAnnouncement(id)}
+          dismissBusyId={dismissAnnouncementBusyId}
+          surface={page === 'vendor' ? 'vendor' : page === 'affiliate' ? 'affiliate' : 'market'}
+        />
+      </div>
+    )}
 
     {page === 'home' && <main className="ydh-container">
       <section
@@ -2506,14 +3083,17 @@ function App() {
             </div>
           </div>
           <div className="home-shop-strip">
-            {shops.slice(0, 4).map(shop => {
+            {filterAndSortShops(shops, { sort: 'popular' }).slice(0, 4).map(shop => {
               const isFollowed = followedShopIds.includes(shop.id) || shop.isFollowed;
               return (
                 <article className="home-shop-card" key={shop.id}>
                   <div className="home-shop-card-top" onClick={() => openPublicShop(shop.id)} role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter') openPublicShop(shop.id); }}>
                     <ShopAvatar shopName={shop.shopName} iconUrl={shop.iconUrl} size="sm" />
                     <div className="home-shop-card-copy">
-                      <b>{shop.shopName}</b>
+                      <b className="shop-inline-verified">
+                        <span>{shop.shopName}</span>
+                        <VerifiedShopBadge verified={shop.isVerified} tierId={shop.verificationTier} size="xs" />
+                      </b>
                       <small className="tabular-nums">
                         {shop.productCount} item{shop.productCount === 1 ? '' : 's'} · {shop.followerCount} follower{shop.followerCount === 1 ? '' : 's'}
                       </small>
@@ -2771,13 +3351,28 @@ function App() {
           <div className="order-history-items"><h3>Items ordered</h3>{order.items.map((item, index) => <div className="manage-row" key={item.productId + '-' + index}><div className="manage-main"><b>{item.name}</b><small>Quantity: {item.quantity}{item.option ? ' · Option: ' + item.option : ''} · Unit price: {money(item.price)}</small></div><b>{money(item.price * item.quantity)}</b></div>)}</div>
           <div className="panel-title"><h3>Order progress</h3><b>{order.status}</b></div>
           {['Cancelled', 'Refunded', 'Returned'].includes(order.status) ? <p className="checkout-note">This order is {order.status.toLowerCase()}.{order.refundStatus ? ' Refund: ' + order.refundStatus + '.' : ''}</p> : <div className="order-progress">{stages.map((stage, index) => <div className={'order-progress-step ' + (currentStage >= index ? 'is-complete' : '')} key={stage}><span>{index + 1}</span><small>{stage}</small></div>)}</div>}
+          {order.paymentMethod === 'Crypto' && (
+            <CryptoTxVerificationTracker
+              order={order}
+              onSubmitTxHash={submitCustomerCryptoTxHash}
+              submitting={submittingCryptoTxOrderId === order.id}
+            />
+          )}
           <div className="total-line"><span>Products subtotal</span><b>{money(subtotal)}</b></div>
-          {transferFee > 0 && <div className="total-line"><span>Bank transfer fee</span><b>{money(transferFee)}</b></div>}
-          <div className="total-line"><span>Order total</span><b>{money(order.total)}</b></div>
+          {transferFee > 0 && <div className="total-line"><span>{order.paymentMethod === 'Crypto' ? `Crypto transfer fee (${formatUsdt(Number(order.cryptoTransferFeeUsdt ?? 1))})` : 'Bank transfer fee'}</span><b>{money(transferFee)}</b></div>}
+          <div className="total-line"><span>Order total</span><b>{money(order.total)}{order.paymentMethod === 'Crypto' && order.cryptoTotalUsdt ? ` · ${formatUsdt(Number(order.cryptoTotalUsdt))}` : ''}</b></div>
           <div className="order-info-grid">
             <div><small>Payment method</small><b>{order.paymentMethod || 'Not recorded'}</b></div>
             <div><small>Payment status</small><b>{paymentStatusLabel(order.paymentStatus)}</b></div>
             <div><small>Payment reference</small><b>{order.paystackReference || order.paymentReference || order.orderNumber}</b></div>
+            {order.paymentMethod === 'Crypto' && (order.cryptoCoin || order.cryptoSymbol || order.cryptoAddress || order.cryptoTotalUsdt) && (
+              <>
+                <div><small>Crypto currency &amp; network</small><b>{[order.cryptoCoin || order.cryptoSymbol, order.cryptoNetwork].filter(Boolean).join(' · ')}</b></div>
+                {order.cryptoTotalUsdt && <div><small>USDT amount (incl. fee)</small><b className="tabular-nums">{formatUsdt(Number(order.cryptoTotalUsdt))} @ ₦{Number(order.cryptoUsdtRate || activeUsdtRate).toLocaleString('en-NG')}/USDT</b></div>}
+                {order.cryptoAddress && <div><small>Receiving wallet</small><b className="word-break-all">{order.cryptoAddress}</b></div>}
+                {order.cryptoTxHash && <div><small>Submitted TX hash</small><b className="word-break-all">{order.cryptoTxHash}</b></div>}
+              </>
+            )}
             <div><small>Paid date</small><b>{order.paymentCompletedAt ? new Date(order.paymentCompletedAt).toLocaleString() : 'Awaiting payment confirmation'}</b></div>
             <div><small>Customer name</small><b>{order.customerName || 'Not provided'}</b></div>
             <div><small>Phone / WhatsApp</small><b>{order.phone || 'Not provided'}</b></div>
@@ -2893,6 +3488,26 @@ function App() {
         clearVendorShopMedia={clearVendorShopMedia}
         shopMediaBusy={shopMediaBusy}
         openPublicShop={openPublicShop}
+        requestedTab={vendorRequestedTab}
+        onClearRequestedTab={() => setVendorRequestedTab('')}
+        verification={vendorVerification}
+        paystackConfigured={vendorVerifyPaystackReady}
+        verificationBusy={vendorVerificationBusy}
+        verificationDocBusy={vendorVerificationDocBusy}
+        onStartVerificationPayment={startVendorVerificationPayment}
+        onVerifyVerificationPaystack={verifyVendorPaystack}
+        onUploadVerificationDocument={uploadVendorVerificationDocument}
+        onSubmitVerificationKyc={submitVendorVerificationKyc}
+        onRefreshVerification={refreshVendorVerification}
+        vendorAnnouncements={vendorAnnouncements}
+        vendorFollowerCount={vendorFollowerCount}
+        vendorAnnouncementForm={vendorAnnouncementForm}
+        setVendorAnnouncementForm={setVendorAnnouncementForm}
+        vendorAnnouncementBusy={vendorAnnouncementBusy}
+        cancellingVendorAnnouncementId={cancellingVendorAnnouncementId}
+        onPublishVendorAnnouncement={publishVendorAnnouncement}
+        onCancelVendorAnnouncement={cancelVendorAnnouncement}
+        onRefreshVendorAnnouncements={loadVendorAnnouncements}
       />
     )}
 
@@ -2932,6 +3547,7 @@ function App() {
         <a href="#admin-products"><ShoppingBag size={15}/> Products</a>
         <a href="#admin-vendors"><Store size={15}/> Vendors</a>
         <a href="#admin-withdrawals"><Wallet size={15}/> Withdrawals</a>
+        <a href="#admin-crypto"><Coins size={15}/> Crypto Payments</a>
         <a href="#admin-order-history"><History size={15}/> Fulfilled history</a>
       </nav>
 
@@ -2951,7 +3567,8 @@ function App() {
           <a href="#admin-orders"><Package/><b>Active order queue</b><small>Update stages, shipping &amp; payment checks cleanly</small></a>
           <button type="button" className="admin-quick-action-btn" onClick={() => void openAdminOrderHistory()}><History/><b>Dedicated Order History Page</b><small>Browse &amp; filter all {allFulfilledOrders.length} completed/closed orders</small></button>
           <a href="#admin-commission-profit"><Calendar/><b>Profit calendar</b><small>Filter daily, monthly &amp; date-range commission profit</small></a>
-          <a href="#admin-payments"><Wallet/><b>Payment verification</b><small>Verify Paystack or confirm incoming bank transfers</small></a>
+          <a href="#admin-payments"><Wallet/><b>Payment verification</b><small>Verify Paystack or confirm incoming bank/crypto payments</small></a>
+          <a href="#admin-crypto"><Coins/><b>Crypto checkout setup</b><small>Configure USDT, USDC, BTC, ETH &amp; wallet networks</small></a>
           <a href="#admin-vendors"><Store/><b>Manage vendors</b><small>Approve, reject or suspend sellers</small></a>
           <a href="#admin-products"><ShoppingBag/><b>Manage products</b><small>Add, edit, approve or remove listings</small></a>
           <a href="#admin-affiliate-marketing"><TrendingUp/><b>Affiliate marketing</b><small>Review applicants, commissions and withdrawals</small></a>
@@ -2964,30 +3581,45 @@ function App() {
       <section className="panel" id="admin-announcements">
         <div className="panel-title">
           <div>
-            <span className="eyebrow">COMMUNICATIONS · BROADCAST</span>
+            <span className="eyebrow">COMMUNICATIONS · BROADCAST &amp; BOARD</span>
             <h2>Marketplace announcements</h2>
-            <p className="muted">Send a saved in-app announcement and notification to all customers, vendors or one audience group.</p>
+            <p className="muted">Publish an announcement to both the live Announcement Board and user alert notifications for all users or one exact group.</p>
           </div>
           <button type="button" className="secondary-btn" onClick={async()=>{try{const r=await api.get('/api/admin/announcements');setAnnouncementHistory(r.data.announcements||[]);}catch(e){setError(errorText(e));}}}>Refresh history</button>
         </div>
         <form className="product-form" onSubmit={sendAnnouncement}>
           <label>Announcement title<input required maxLength={120} value={announcement.title} onChange={e=>setAnnouncement({...announcement,title:e.target.value})} placeholder="Announcement title"/></label>
-          <label>Audience<select value={announcement.audience} onChange={e=>setAnnouncement({...announcement,audience:e.target.value})}><option value="all">All customers and vendors</option><option value="customers">Customers only</option><option value="vendors">Vendors only</option></select></label>
+          <label>Audience<select value={announcement.audience} onChange={e=>setAnnouncement({...announcement,audience:e.target.value})}>{ANNOUNCEMENT_AUDIENCE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}</select></label>
           <label className="full-field">Message<textarea required maxLength={1000} rows={3} value={announcement.message} onChange={e=>setAnnouncement({...announcement,message:e.target.value})} placeholder="Write your announcement..."/></label>
-          <button className="primary-btn" disabled={busy || !announcement.title.trim() || !announcement.message.trim()}>{busy?'Sending...':'Send announcement'}</button>
+          <button className="primary-btn" disabled={busy || !announcement.title.trim() || !announcement.message.trim()}>{busy?'Sending...':'Send & publish announcement'}</button>
         </form>
         <h3>Recent announcements ({announcementHistory.length})</h3>
         <div className="admin-scroll-list">
-          {announcementHistory.length ? announcementHistory.map((item:any) => (
-            <div className="manage-row" key={item.id}>
-              <div className="manage-main">
-                <b>{item.title}</b>
-                <small>{item.audience === 'all' ? 'Customers and vendors' : item.audience} · {item.deliveredCount ?? item.sentCount ?? 0} notified · {item.createdAt ? new Date(item.createdAt).toLocaleString() : ''}</small>
-                <p>{item.message}</p>
+          {announcementHistory.length ? announcementHistory.map((item:any) => {
+            const activeOnBoard = isAnnouncementActive(item);
+            return (
+              <div className="manage-row" key={item.id}>
+                <div className="manage-main">
+                  <b>{item.title}</b>
+                  <small>{formatAnnouncementAudienceLabel(item.audience)} · {item.deliveredCount ?? item.sentCount ?? 0} notified · {item.createdAt ? new Date(item.createdAt).toLocaleString() : ''}</small>
+                  <p>{item.message}</p>
+                </div>
+                <span className={'status ' + (activeOnBoard ? 'approved' : 'Cancelled')}>
+                  {activeOnBoard ? 'Active on board' : 'Cancelled'}
+                </span>
+                {activeOnBoard && (
+                  <button
+                    type="button"
+                    className="secondary-btn danger-outline-btn"
+                    disabled={cancellingAnnouncementId === item.id}
+                    onClick={() => void cancelAdminAnnouncement(String(item.id))}
+                  >
+                    <X size={14} /> {cancellingAnnouncementId === item.id ? 'Cancelling...' : 'Cancel from board'}
+                  </button>
+                )}
               </div>
-              <span className="status approved">Saved</span>
-            </div>
-          )) : <p className="muted">No announcements have been sent yet.</p>}
+            );
+          }) : <p className="muted">No announcements have been sent yet.</p>}
         </div>
       </section>
 
@@ -3429,7 +4061,41 @@ function App() {
 
       <section className="panel"><div className="panel-title"><div><h2>All marketplace products ({products.length})</h2><p>Review, edit product details, photos, pricing, stock and affiliate commission.</p></div><button className="secondary-btn" onClick={setDefaultAffiliateRates} disabled={busy}>Set missing affiliate rates to 5%</button></div><div className="admin-scroll-list">{products.map(p=><div className="manage-row" key={p.id}><div className="mini-product">{p.images?.[0]?<img src={p.images[0]} alt=""/>:<Package/>}</div><div className="manage-main"><b>{p.name}</b><small>{p.vendorName} · {money(p.price)} · Affiliate {Number(p.affiliateCommissionPercent ?? 0)}% · {p.status}</small></div><button onClick={()=>startEdit(p)}>Edit</button>{p.status !== 'approved' && <button onClick={()=>approveProduct(p.id,'approved')}>Approve</button>}<select aria-label={'Product status for '+p.name} value={p.status} onChange={e=>approveProduct(p.id,e.target.value)}><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select><button className="danger-icon" onClick={()=>deleteProduct(p.id)}><Trash2 size={17}/></button></div>)}</div></section>
 
-      <section className="panel" id="admin-vendors"><h2>Vendor applications and permissions</h2>{vendors.length ? vendors.map(v=><div className="manage-row" key={v.id}><div className="vendor-avatar"><Store/></div><div className="manage-main"><b>{v.shopName}</b><small>{v.ownerName} · {v.email} · {v.phone}</small><small>{v.description}</small></div><span className={'status '+v.status}>{v.status}</span><select value={v.status} onChange={e=>approveVendor(v.id,e.target.value)}><option value="pending">Pending</option><option value="approved">Approve vendor</option><option value="rejected">Reject</option><option value="suspended">Suspend</option></select></div>) : <p className="muted">No vendor applications yet.</p>}</section>
+      <section className="panel" id="admin-vendors">
+        <h2>Vendor applications and permissions</h2>
+        {vendors.length ? vendors.map(v => {
+          const badgeActive = isVendorVerificationActive(v);
+          return (
+            <div className="manage-row" key={v.id}>
+              <div className="vendor-avatar"><Store/></div>
+              <div className="manage-main">
+                <b className="shop-inline-verified">
+                  <span>{v.shopName}</span>
+                  <VerifiedShopBadge verified={badgeActive} tierId={v.verificationTier} size="sm" showLabel />
+                </b>
+                <small>{v.ownerName} · {v.email} · {v.phone}</small>
+                <small>{v.description}</small>
+              </div>
+              <span className={'status ' + v.status}>{v.status}</span>
+              <select value={v.status} onChange={e => approveVendor(v.id, e.target.value)}>
+                <option value="pending">Pending</option>
+                <option value="approved">Approve vendor</option>
+                <option value="rejected">Reject</option>
+                <option value="suspended">Suspend</option>
+              </select>
+            </div>
+          );
+        }) : <p className="muted">No vendor applications yet.</p>}
+
+        <AdminVerificationQueue
+          verifications={adminVerifications}
+          money={money}
+          busy={adminVerifyBusy}
+          onConfirmTransfer={confirmAdminVerificationTransfer}
+          onReviewVerification={reviewAdminVerification}
+          onRefresh={loadAdmin}
+        />
+      </section>
 
       <section className="panel" id="admin-coupons"><div className="panel-title"><div><h2>Marketplace coupon management</h2><p>Create coupons that apply to all marketplace products or selected products. Choose an exact expiry date and time.</p></div></div>
         <form className="product-form" onSubmit={saveAdminCoupon}>
@@ -3448,6 +4114,14 @@ function App() {
       </section>
 
       <section className="panel" id="admin-finance"><h2>Marketplace fees &amp; earnings settings</h2><div className="product-form"><label>Customer transfer fee (₦)<input type="number" min="0" value={settings?.customerTransferFee ?? 100} onChange={e=>setSettings(current => ({...normalizeMarketSettings(current),customerTransferFee:Number(e.target.value)}))}/></label><label>Vendor withdrawal fee (₦)<input type="number" min="0" value={settings?.withdrawalFee ?? 100} onChange={e=>setSettings(current => ({...normalizeMarketSettings(current),withdrawalFee:Number(e.target.value)}))}/></label><label>Default marketplace commission (%)<input type="number" min="0" max="100" step="0.1" value={settings?.commissionPercent ?? 8} onChange={e=>setSettings(current => ({...normalizeMarketSettings(current),commissionPercent:Number(e.target.value)}))}/><small>Default is 8%. The owner can override this percentage on individual products.</small></label><label>Wallet funding fee (₦)<input type="number" value="100" readOnly/><small>Fixed at ₦100 for every wallet funding request.</small></label><label>Customer cashback (%)<input type="number" min="0" max="100" step="0.1" value={settings?.cashbackPercent ?? 1} onChange={e=>setSettings(current => ({...normalizeMarketSettings(current),cashbackPercent:Number(e.target.value)}))}/></label><button className="primary-btn" onClick={saveSettings}>Save marketplace settings</button></div><p className="muted">Cashback percentage is stored as a setting; customer wallet crediting is not enabled in this release.</p></section>
+      <AdminCryptoPanel
+        cryptoSettings={cryptoSettings}
+        onChangeCryptoSettings={setCryptoSettings}
+        onSaveCryptoSettings={saveAdminCryptoSettings}
+        onSyncGoogleRate={syncAdminGoogleCryptoRate}
+        saving={cryptoSettingsBusy}
+        syncingRate={cryptoRateSyncBusy}
+      />
       <section className="panel" id="admin-vendor-funding"><h2>Fund a vendor wallet</h2><p className="muted">As marketplace owner, manually add any amount to an approved vendor&apos;s spendable wallet balance.</p><form className="product-form" onSubmit={fundVendorWallet}><label>Vendor<select required value={vendorCreditForm.vendorId} onChange={e=>setVendorCreditForm({...vendorCreditForm,vendorId:e.target.value})}><option value="">Select approved vendor</option>{vendors.filter(v=>v.status==='approved').map(v=><option key={v.id} value={v.id}>{v.shopName} — {v.email}</option>)}</select></label><label>Amount to add (₦)<input type="number" min="1" max="10000000" required value={vendorCreditForm.amount} onChange={e=>setVendorCreditForm({...vendorCreditForm,amount:e.target.value})}/></label><button className="primary-btn" disabled={busy || !vendorCreditForm.vendorId}>Add money to vendor wallet</button></form></section>
       <section className="panel" id="admin-topups"><h2>Customer wallet top-up requests</h2><p className="muted">Review all incoming wallet funding. For manual bank transfers, confirm only after the money is received in your bank account. For Paystack, use server-side verification: the wallet is credited only when Paystack confirms success and the amount, currency and reference match. If Paystack still reports pending or failed, the request stays pending and no credit is made. Rejecting a request never credits the wallet.</p>{walletTopups.length ? walletTopups.map(t=><div className="manage-row" key={t.id}><div className="manage-main"><b>{t.userName || t.email || 'Customer'} · {money(t.amount)} wallet credit</b><small>{t.role} · {t.email || 'No email'} · {t.paymentMethod} · Fee {money(t.fee)} · Total received {money(t.total)} · {new Date(t.createdAt).toLocaleString()}</small><small>Reference: {t.id}{t.paystackReference ? ' · Paystack reference: '+t.paystackReference : ''} · Status: {t.status}</small></div>{t.status==='pending' && <>{t.paymentMethod==='Bank transfer' ? <button className="primary-btn" onClick={()=>confirmWalletTopup(t.id)}>Confirm received transfer &amp; credit</button> : t.paymentMethod==='Paystack' ? <button className="primary-btn" onClick={()=>confirmWalletTopup(t.id)}>Verify Paystack &amp; credit if successful</button> : null}<button className="secondary-btn" onClick={()=>rejectWalletTopup(t.id)}>Reject request</button></>}<span className={'status '+(t.status==='completed'?'approved':t.status)}>{t.status}</span></div>) : <p className="muted">No customer wallet top-up requests.</p>}</section>
       <section className="panel" id="admin-customer-funding"><h2>Manually fund a customer wallet</h2><p className="muted">As marketplace owner, select a customer and add any amount directly to their spendable wallet balance. This is separate from vendor wallet funding and customer top-up requests.</p><form className="product-form" onSubmit={fundCustomerWallet}><label>Customer<select required value={customerCreditForm.customerId} onChange={e=>setCustomerCreditForm({...customerCreditForm,customerId:e.target.value})}><option value="">Select customer account</option>{adminUsers.filter(u=>u.vendorStatus==='customer').map(u=><option key={u.id} value={u.id}>{u.fullName || 'Customer'} — {u.email || u.id}</option>)}</select></label><label>Amount to add (₦)<input type="number" min="1" max="10000000" required value={customerCreditForm.amount} onChange={e=>setCustomerCreditForm({...customerCreditForm,amount:e.target.value})} placeholder="Enter amount"/></label><button type="submit" className="primary-btn" disabled={busy || !customerCreditForm.customerId || !customerCreditForm.amount}>Manually add money to customer wallet</button></form><p className="checkout-note">Customer accounts appear after they sign in and open their profile. Manual credits are recorded in wallet transaction history.</p></section>
@@ -3924,7 +4598,7 @@ function App() {
       )}
     </main>}
 
-    {selectedProduct && <div className="overlay product-detail-overlay" onClick={closeProduct}><section className="product-detail-panel temu-detail" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI MARKETPLACE · PRODUCT</span><h2>{selectedProduct.name}</h2></div><button className="icon-btn" aria-label="Close product details" onClick={closeProduct}><X/></button></div><div className="detail-gallery"><button className="detail-main-image" onClick={()=>photoCount && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] && setPhotoViewerOpen(true)} aria-label="Open full size product photos">{selectedProduct.images?.length && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] ? <img src={selectedProduct.images[Math.min(selectedImageIndex,selectedProduct.images.length-1)]} alt={selectedProduct.name} referrerPolicy="no-referrer" onError={() => markImageFailed('detail:' + selectedProduct.id + ':' + selectedImageIndex)}/> : <div className="media-placeholder"><Package size={54}/><span>{selectedProduct.category}</span></div>}<span className="photo-open-hint">{photoCount ? 'Tap photo to view full size' : 'No product photos'}</span></button>{(selectedProduct.images?.length || 0)>1 && <div className="detail-thumbnails">{selectedProduct.images.map((url,index)=><button className={selectedImageIndex===index?'active':''} key={url+index} onClick={()=>setSelectedImageIndex(index)}><img src={url} alt={'Product view '+(index+1)} referrerPolicy="no-referrer"/></button>)}</div>}{selectedProduct.videos?.length>0 && <div className="detail-video-list">{selectedProduct.videos.map((url,index)=><video key={index} src={url} controls playsInline/> )}</div>}</div><div className="detail-product-info"><span className="product-meta-cat">{selectedProduct.category}</span><h2 className="detail-title">{selectedProduct.name}</h2><div className="detail-price-row"><b>{selectedProduct.discountActive ? <span className="sale-prices"><del>{money(selectedProduct.standardPrice || selectedProduct.price)}</del><strong>{money(selectedProduct.price)}</strong><small>-{selectedProduct.discountPercent}%</small></span> : money(selectedProduct.price)}</b><span className={selectedProduct.stock>0?'stock-live':'stock-out'}>{selectedProduct.stock>0?'In stock · '+selectedProduct.stock+' available':'Out of stock'}</span></div><p className="detail-description">{selectedProduct.description}</p>{(() => {
+    {selectedProduct && <div className="overlay product-detail-overlay" onClick={closeProduct}><section className="product-detail-panel temu-detail" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI MARKETPLACE · PRODUCT</span><h2>{selectedProduct.name}</h2></div><button className="icon-btn" aria-label="Close product details" onClick={closeProduct}><X/></button></div><div className="detail-gallery"><button className="detail-main-image" onClick={()=>photoCount && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] && setPhotoViewerOpen(true)} aria-label="Open full size product photos">{selectedProduct.images?.length && !failedImages['detail:' + selectedProduct.id + ':' + selectedImageIndex] ? <img src={selectedProduct.images[Math.min(selectedImageIndex,selectedProduct.images.length-1)]} alt={selectedProduct.name} referrerPolicy="no-referrer" onError={() => markImageFailed('detail:' + selectedProduct.id + ':' + selectedImageIndex)}/> : <div className="media-placeholder"><Package size={54}/><span>{selectedProduct.category}</span></div>}<span className="photo-open-hint">{photoCount ? 'Tap photo to view full size' : 'No product photos'}</span></button>{(selectedProduct.images?.length || 0)>1 && <div className="detail-thumbnails">{selectedProduct.images.map((url,index)=><button className={selectedImageIndex===index?'active':''} key={url+index} onClick={()=>setSelectedImageIndex(index)}><img src={url} alt={'Product view '+(index+1)} referrerPolicy="no-referrer"/></button>)}</div>}{selectedProduct.videos?.length>0 && <div className="detail-video-list">{selectedProduct.videos.map((url,index)=><video key={index} src={url} controls playsInline/> )}</div>}</div><div className="detail-product-info"><span className="product-meta-cat">{selectedProduct.category}</span><h2 className="detail-title">{selectedProduct.name}</h2><div className="detail-price-row"><div className="detail-price-stack tabular-nums"><b>{selectedProduct.discountActive ? <span className="sale-prices"><del>{money(selectedProduct.standardPrice || selectedProduct.price)}</del><strong>{money(selectedProduct.price)}</strong><small>-{selectedProduct.discountPercent}%</small></span> : money(selectedProduct.price)}</b><span className="detail-usdt-price">≈ {usdtText(selectedProduct.price)} <small>(1 USDT = ₦{activeUsdtRate.toLocaleString('en-NG')})</small></span></div><span className={selectedProduct.stock>0?'stock-live':'stock-out'}>{selectedProduct.stock>0?'In stock · '+selectedProduct.stock+' available':'Out of stock'}</span></div><p className="detail-description">{selectedProduct.description}</p>{(() => {
         const productShop = shops.find(s => s.id === selectedProduct.vendorId);
         const isShopFollowed = productShop ? (followedShopIds.includes(productShop.id) || productShop.isFollowed) : false;
         return (
@@ -3936,11 +4610,19 @@ function App() {
                 size="sm"
               />
               <div>
-                <b>{productShop?.shopName || selectedProduct.vendorName || 'Yakaji Digital Hub'}</b>
+                <b className="shop-inline-verified">
+                  <span>{productShop?.shopName || selectedProduct.vendorName || 'Yakaji Digital Hub'}</span>
+                  <VerifiedShopBadge
+                    verified={Boolean(productShop?.isVerified || selectedProduct.vendorVerified)}
+                    tierId={productShop?.verificationTier || selectedProduct.vendorVerificationTier}
+                    size="sm"
+                    showLabel
+                  />
+                </b>
                 <small className="tabular-nums">
                   {productShop
                     ? `${productShop.followerCount} follower${productShop.followerCount === 1 ? '' : 's'} · ${productShop.productCount} listing${productShop.productCount === 1 ? '' : 's'}`
-                    : 'Verified Marketplace Seller'}
+                    : 'Marketplace Seller'}
                 </small>
               </div>
             </div>
@@ -3975,7 +4657,7 @@ function App() {
             </div>
           </div>
         );
-      })()}<div className="product-share-panel"><b>Share this product</b><div className="product-share-actions"><button type="button" className="secondary-btn" onClick={()=>copyProductLink(selectedProduct)}><Copy size={15}/> Copy link</button><button type="button" className="primary-btn" onClick={()=>shareProduct(selectedProduct)}><Share2 size={15}/> Share</button><a className="share-social whatsapp" href={'https://wa.me/?text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price)+'. View on Yakaji Digital Hub: '+productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer"><MessageCircle size={15}/> WhatsApp</a><a className="share-social" href={'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer">Facebook</a><a className="share-social" href={'https://twitter.com/intent/tweet?url='+encodeURIComponent(productShareUrl(selectedProduct))+'&text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price))} target="_blank" rel="noopener noreferrer">X / Twitter</a></div><small className="muted">Anyone who opens this link will go directly to this product.</small></div>{selectedProduct.options?.length>0 && <label className="detail-option">Select an option<select value={selectedProductOption} onChange={e=>setSelectedProductOption(e.target.value)}>{selectedProduct.options.map(option=><option key={option}>{option}</option>)}</select></label>}<div className="detail-quantity"><b>Quantity</b><div><button disabled={detailQuantity<=1} onClick={()=>setDetailQuantity(q=>Math.max(1,q-1))}>−</button><span>{detailQuantity}</span><button disabled={detailQuantity>=selectedProduct.stock} onClick={()=>setDetailQuantity(q=>Math.min(selectedProduct.stock,q+1))}>+</button></div></div><div className="detail-assurances"><div><span className="detail-assurances-icon"><Truck size={16}/></span><p><b>Delivery arrangement</b><small>Confirm delivery details at checkout</small></p></div><div><span className="detail-assurances-icon"><Lock size={16}/></span><p><b>Secure payment choices</b><small>Wallet, Paystack or bank transfer</small></p></div><div><span className="detail-assurances-icon"><Headphones size={16}/></span><p><b>Marketplace support</b><small>Order assistance from Yakaji Digital Hub</small></p></div></div>
+      })()}<div className="product-share-panel"><b>Share this product</b><div className="product-share-actions"><button type="button" className="secondary-btn" onClick={()=>copyProductLink(selectedProduct)}><Copy size={15}/> Copy link</button><button type="button" className="primary-btn" onClick={()=>shareProduct(selectedProduct)}><Share2 size={15}/> Share</button><a className="share-social whatsapp" href={'https://wa.me/?text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price)+' ('+usdtText(selectedProduct.price)+'). View on Yakaji Digital Hub: '+productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer"><MessageCircle size={15}/> WhatsApp</a><a className="share-social" href={'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(productShareUrl(selectedProduct))} target="_blank" rel="noopener noreferrer">Facebook</a><a className="share-social" href={'https://twitter.com/intent/tweet?url='+encodeURIComponent(productShareUrl(selectedProduct))+'&text='+encodeURIComponent(selectedProduct.name+' — '+money(selectedProduct.price))} target="_blank" rel="noopener noreferrer">X / Twitter</a></div><small className="muted">Anyone who opens this link will go directly to this product.</small></div>{selectedProduct.options?.length>0 && <label className="detail-option">Select an option<select value={selectedProductOption} onChange={e=>setSelectedProductOption(e.target.value)}>{selectedProduct.options.map(option=><option key={option}>{option}</option>)}</select></label>}<div className="detail-quantity"><b>Quantity</b><div><button disabled={detailQuantity<=1} onClick={()=>setDetailQuantity(q=>Math.max(1,q-1))}>−</button><span>{detailQuantity}</span><button disabled={detailQuantity>=selectedProduct.stock} onClick={()=>setDetailQuantity(q=>Math.min(selectedProduct.stock,q+1))}>+</button></div></div><div className="detail-assurances"><div><span className="detail-assurances-icon"><Truck size={16}/></span><p><b>Delivery arrangement</b><small>Confirm delivery details at checkout</small></p></div><div><span className="detail-assurances-icon"><Lock size={16}/></span><p><b>Secure payment choices</b><small>Naira (Wallet, Paystack, Bank) or USDT Crypto</small></p></div><div><span className="detail-assurances-icon"><Headphones size={16}/></span><p><b>Marketplace support</b><small>Order assistance from Yakaji Digital Hub</small></p></div></div>
       <section className="product-review-section">
         <div className="review-heading">
           <div>
@@ -4054,14 +4736,143 @@ function App() {
           </div>
         )}
       </section>
-      <button className="primary-btn full-btn detail-add-btn" disabled={selectedProduct.stock<1} onClick={()=>{addToCart(selectedProduct,selectedProductOption,detailQuantity);setSelectedProduct(null);}}><ShoppingBag size={17}/> Add {detailQuantity} to cart · {money(selectedProduct.price*detailQuantity)}</button></div></section></div>}
+      <button className="primary-btn full-btn detail-add-btn" disabled={selectedProduct.stock<1} onClick={()=>{addToCart(selectedProduct,selectedProductOption,detailQuantity);setSelectedProduct(null);}}><ShoppingBag size={17}/> Add {detailQuantity} to cart · {money(selectedProduct.price*detailQuantity)} · {usdtText(selectedProduct.price*detailQuantity)}</button></div></section></div>}
     {photoViewerOpen && selectedProduct && photoCount>0 && <div className="photo-viewer-overlay" onClick={()=>setPhotoViewerOpen(false)}><div className="photo-viewer" onClick={e=>e.stopPropagation()} onTouchStart={e=>setTouchStartX(e.touches[0].clientX)} onTouchEnd={e=>{if(touchStartX!==null){const delta=e.changedTouches[0].clientX-touchStartX;if(Math.abs(delta)>45)changePhoto(delta<0?1:-1);}setTouchStartX(null);}}><div className="photo-viewer-toolbar"><span>{selectedProduct.name} · {selectedImageIndex+1} / {photoCount}</span><button className="photo-viewer-close" aria-label="Close photo viewer" onClick={()=>setPhotoViewerOpen(false)}><X/></button></div><button className="photo-viewer-arrow previous" aria-label="Previous photo" onClick={()=>changePhoto(-1)} disabled={photoCount<2}><ChevronLeft/></button><img className="photo-viewer-image" src={activePhoto} alt={selectedProduct.name+' full size photo '+(selectedImageIndex+1)} referrerPolicy="no-referrer"/><button className="photo-viewer-arrow next" aria-label="Next photo" onClick={()=>changePhoto(1)} disabled={photoCount<2}><ChevronRight/></button><div className="photo-viewer-thumbnails">{selectedProduct.images.map((url,index)=><button key={url+index} className={selectedImageIndex===index?'active':''} onClick={()=>setSelectedImageIndex(index)}><img src={url} alt={'Select photo '+(index+1)} referrerPolicy="no-referrer"/></button>)}</div><small>Swipe left or right to browse photos · Use arrow keys on desktop</small></div></div>}
-    {checkoutOpen && <div className="overlay" onClick={()=>setCheckoutOpen(false)}><section className="checkout" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YOUR SHOPPING CART</span><h2>Checkout</h2></div><button className="icon-btn" onClick={()=>setCheckoutOpen(false)}><X/></button></div>{cart.length ? <><div className="cart-lines">{cart.map(line=><div className="cart-line" key={line.product.id}><div><b>{line.product.name}</b><small>{line.product.discountActive ? <><del>{money(line.product.standardPrice || line.product.price)}</del> {money(line.product.price)} sale price</> : money(line.product.price)} each</small>{line.product.options.length>0&&<select value={line.option} onChange={e=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,option:e.target.value}:x))}>{line.product.options.map(o=><option key={o}>{o}</option>)}</select>}</div><div className="qty"><button onClick={()=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,quantity:Math.max(1,x.quantity-1)}:x))}>−</button><b>{line.quantity}</b><button onClick={()=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,quantity:Math.min(x.product.stock,x.quantity+1)}:x))}>+</button><button className="remove" onClick={()=>setCart(items=>items.filter(x=>x.product.id!==line.product.id))}><Trash2 size={15}/></button></div></div>)}</div><div className="total-line"><span>Products subtotal</span><b>{money(cartSubtotal)}</b></div>
-      <div className="coupon-entry"><label>Have a coupon code?</label><div><input value={couponCode} onChange={e=>{setCouponCode(e.target.value.toUpperCase());setAppliedCoupon(null);}} placeholder="Enter coupon code"/><button type="button" className="secondary-btn" onClick={applyCoupon} disabled={couponBusy || !couponCode.trim()}>{couponBusy?'Checking...':'Apply'}</button></div>{appliedCoupon && <small className="coupon-success">✓ {appliedCoupon.code} applied — you save {money(couponSavings)}</small>}</div>
-      {couponSavings>0 && <div className="total-line coupon-saving"><span>Coupon discount</span><b>−{money(couponSavings)}</b></div>}
-      {customer.paymentMethod === 'Bank transfer' && <div className="total-line"><span>Transfer fee</span><b>{money(transferFee)}</b></div>}<div className="total-line"><span>Total to pay</span><b>{money(cartTotal)}</b></div><form className="checkout-form" onSubmit={placeOrder}><label>Full name<input required value={customer.name} onChange={e=>setCustomer({...customer,name:e.target.value})}/></label><label>Phone / WhatsApp<input required type="tel" minLength={7} value={customer.phone} onChange={e=>setCustomer({...customer,phone:e.target.value})}/></label><label>Email {customer.paymentMethod === 'Paystack' ? '(required for payment receipt)' : '(optional for guest checkout)'}<input required={customer.paymentMethod === 'Paystack'} type="email" value={customer.email} onChange={e=>setCustomer({...customer,email:e.target.value})} placeholder="name@example.com"/></label><label>Delivery address / instructions<textarea rows={2} value={customer.address} onChange={e=>setCustomer({...customer,address:e.target.value})}/></label><label>Payment method<select value={customer.paymentMethod} onChange={e=>setCustomer({...customer,paymentMethod:e.target.value})}><option value="Wallet" disabled={!user}>1. Pay with wallet ({money(walletSummary?.balance || 0)} available)</option><option value="Paystack" disabled={!paystackReady}>2. Pay online with Paystack (Card / Bank / USSD){paystackReady ? '' : ' — awaiting setup'}</option><option value="Bank transfer">3. Manual bank transfer</option></select></label><p className="checkout-note">You can order as a guest without creating an account. Email is optional for manual bank transfer, but required for Paystack receipts. Create an account or sign in if you want to use your wallet, save your profile and manage your account when you return. Manual transfers are confirmed by the marketplace admin. {paystackMode === 'test' ? 'Paystack is currently in TEST MODE: test payments are simulations and cannot collect real customer money.' : paystackMode === 'live' ? 'Paystack is connected in LIVE MODE.' : ''}</p><button className="primary-btn full-btn" disabled={busy}>{busy?'Placing order...':'Place order'} <ArrowRight size={17}/></button></form></> : <div className="empty-box"><ShoppingBag size={40}/><h3>Your cart is empty</h3><p>Add products from the marketplace to begin.</p><button className="primary-btn" onClick={()=>setCheckoutOpen(false)}>Continue shopping</button></div>}</section></div>}
+    {checkoutOpen && <div className="overlay" onClick={()=>setCheckoutOpen(false)}><section className="checkout" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YOUR SHOPPING CART</span><h2>Checkout</h2></div><button className="icon-btn" onClick={()=>setCheckoutOpen(false)}><X/></button></div>{cart.length ? <><div className="cart-lines">{cart.map(line=><div className="cart-line" key={line.product.id}><div><b>{line.product.name}</b><small className="tabular-nums">{line.product.discountActive ? <><del>{money(line.product.standardPrice || line.product.price)}</del> {money(line.product.price)} sale price</> : money(line.product.price)} · ≈ {usdtText(line.product.price)} each</small>{line.product.options.length>0&&<select value={line.option} onChange={e=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,option:e.target.value}:x))}>{line.product.options.map(o=><option key={o}>{o}</option>)}</select>}</div><div className="qty"><button onClick={()=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,quantity:Math.max(1,x.quantity-1)}:x))}>−</button><b>{line.quantity}</b><button onClick={()=>setCart(items=>items.map(x=>x.product.id===line.product.id?{...x,quantity:Math.min(x.product.stock,x.quantity+1)}:x))}>+</button><button className="remove" onClick={()=>setCart(items=>items.filter(x=>x.product.id!==line.product.id))}><Trash2 size={15}/></button></div></div>)}</div><div className="total-line tabular-nums"><span>Products subtotal</span><b>{money(cartSubtotal)} · ≈ {usdtText(cartSubtotal)}</b></div>
+      <div className="coupon-entry"><label>Have a coupon code?</label><div><input value={couponCode} onChange={e=>{setCouponCode(e.target.value.toUpperCase());setAppliedCoupon(null);}} placeholder="Enter coupon code"/><button type="button" className="secondary-btn" onClick={applyCoupon} disabled={couponBusy || !couponCode.trim()}>{couponBusy?'Checking...':'Apply'}</button></div>{appliedCoupon && <small className="coupon-success">✓ {appliedCoupon.code} applied — you save {money(couponSavings)} ({usdtText(couponSavings)})</small>}</div>
+      {couponSavings>0 && <div className="total-line coupon-saving tabular-nums"><span>Coupon discount</span><b>−{money(couponSavings)} · −{usdtText(couponSavings)}</b></div>}
+      {customer.paymentMethod === 'Bank transfer' && <div className="total-line tabular-nums"><span>Bank transfer fee</span><b>{money(transferFee)}</b></div>}
+      {customer.paymentMethod === 'Crypto' && <div className="total-line tabular-nums"><span>Crypto transfer fee ({formatUsdt(cryptoBreakdown.transferFeeUsdt)})</span><b>+{formatUsdt(cryptoBreakdown.transferFeeUsdt)} ({money(cryptoBreakdown.transferFeeNgn)})</b></div>}
+      <div className="total-line tabular-nums"><span>Total to pay</span><b>{customer.paymentMethod === 'Crypto' ? `${formatUsdt(cryptoBreakdown.totalUsdt)} · ${money(cartTotal)}` : `${money(cartTotal)} · ≈ ${usdtText(cartTotal)}`}</b></div><form className="checkout-form" onSubmit={placeOrder}><label>Full name<input required value={customer.name} onChange={e=>setCustomer({...customer,name:e.target.value})}/></label><label>Phone / WhatsApp<input required type="tel" minLength={7} value={customer.phone} onChange={e=>setCustomer({...customer,phone:e.target.value})}/></label><label>Email {customer.paymentMethod === 'Paystack' ? '(required for payment receipt)' : '(optional for guest checkout)'}<input required={customer.paymentMethod === 'Paystack'} type="email" value={customer.email} onChange={e=>setCustomer({...customer,email:e.target.value})} placeholder="name@example.com"/></label><label>Delivery address / instructions<textarea rows={2} value={customer.address} onChange={e=>setCustomer({...customer,address:e.target.value})}/></label><label>Payment method<select value={customer.paymentMethod} onChange={e=>setCustomer({...customer,paymentMethod:e.target.value})}><option value="Wallet" disabled={!user}>1. Pay with wallet ({money(walletSummary?.balance || 0)} available)</option><option value="Paystack" disabled={!paystackReady}>2. Pay online with Paystack (Card / Bank / USSD){paystackReady ? '' : ' — awaiting setup'}</option><option value="Bank transfer">3. Manual bank transfer (Naira)</option>{publicCrypto.enabled && activeCryptoWallets.length > 0 ? <option value="Crypto">4. Pay with USDT Dollar / Crypto ({[...new Set(activeCryptoWallets.map((w) => w.symbol))].join(' / ')}) · +{formatUsdt(activeCryptoFeeUsdt)} fee</option> : <option value="Crypto" disabled>4. Pay with USDT Dollar / Crypto — awaiting wallet setup</option>}</select></label>
+      {customer.paymentMethod === 'Crypto' && activeCryptoWallets.length > 0 && (
+        <div className="full-field checkout-crypto-box">
+          <div className="checkout-crypto-rate-summary tabular-nums">
+            <div>
+              <span>Exchange rate: 1 USDT = ₦{cryptoBreakdown.usdtNgnRate.toLocaleString('en-NG')}</span>
+              <span>Items: {formatUsdt(cryptoBreakdown.itemsUsdt)} + Fee: {formatUsdt(cryptoBreakdown.transferFeeUsdt)}</span>
+            </div>
+            <div className="checkout-crypto-due-row">
+              <strong>Exact total to send: {formatUsdt(cryptoBreakdown.totalUsdt)}</strong>
+              <button
+                type="button"
+                className="secondary-btn crypto-copy-inline"
+                onClick={() => navigator.clipboard?.writeText(cryptoBreakdown.totalUsdt.toFixed(2)).then(() => flash(`Copied ${cryptoBreakdown.totalUsdt.toFixed(2)} USDT to clipboard.`))}
+              >
+                <Copy size={13}/> Copy {cryptoBreakdown.totalUsdt.toFixed(2)}
+              </button>
+            </div>
+          </div>
+          <div className="checkout-crypto-head">
+            <b><Coins size={15}/> Choose coin &amp; blockchain network</b>
+            <small>{publicCrypto.checkoutNote}</small>
+          </div>
+          <div className="checkout-crypto-grid">
+            {activeCryptoWallets.map((w) => {
+              const selected = selectedCheckoutCryptoWallet?.id === w.id;
+              return (
+                <button
+                  type="button"
+                  key={w.id}
+                  className={'checkout-crypto-option' + (selected ? ' selected' : '')}
+                  onClick={() => setCryptoWalletId(w.id)}
+                >
+                  <b>{w.symbol}</b>
+                  <span>{w.network}</span>
+                </button>
+              );
+            })}
+          </div>
+          {selectedCheckoutCryptoWallet && (
+            <div className="crypto-wallet-box">
+              <div className="crypto-wallet-box-head">
+                <small>Receiving address · {selectedCheckoutCryptoWallet.coin} ({selectedCheckoutCryptoWallet.network})</small>
+                <button
+                  type="button"
+                  className="secondary-btn crypto-copy-inline"
+                  onClick={() => navigator.clipboard?.writeText(selectedCheckoutCryptoWallet.address).then(() => flash(`${selectedCheckoutCryptoWallet.symbol} wallet address copied.`))}
+                >
+                  <Copy size={13}/> Copy address
+                </button>
+              </div>
+              <code className="crypto-address-mono">{selectedCheckoutCryptoWallet.address}</code>
+              {selectedCheckoutCryptoWallet.instructions && (
+                <small className="crypto-wallet-note">{selectedCheckoutCryptoWallet.instructions}</small>
+              )}
+            </div>
+          )}
+          <label className="checkout-crypto-hash-field">
+            Transaction hash / sender reference (optional)
+            <input
+              maxLength={140}
+              value={cryptoTxHash}
+              onChange={(e) => setCryptoTxHash(e.target.value)}
+              placeholder="Paste TXID or wallet reference after sending, or leave blank and submit after checkout"
+            />
+          </label>
+        </div>
+      )}
+      <p className="checkout-note">You can order as a guest without creating an account. Email is optional for manual bank transfer or crypto checkout, but required for Paystack receipts. Create an account or sign in if you want to use your wallet, save your profile and manage your account when you return. Manual bank &amp; cryptocurrency transfers are verified by the marketplace admin. {paystackMode === 'test' ? 'Paystack is currently in TEST MODE: test payments are simulations and cannot collect real customer money.' : paystackMode === 'live' ? 'Paystack is connected in LIVE MODE.' : ''}</p><button className="primary-btn full-btn" disabled={busy}>{busy?'Placing order...':'Place order'} <ArrowRight size={17}/></button></form></> : <div className="empty-box"><ShoppingBag size={40}/><h3>Your cart is empty</h3><p>Add products from the marketplace to begin.</p><button className="primary-btn" onClick={()=>setCheckoutOpen(false)}>Continue shopping</button></div>}</section></div>}
     {walletTransferDetails && <div className="overlay" onClick={()=>setWalletTransferDetails(null)}><section className="checkout transfer-instructions" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">WALLET FUNDING · MANUAL BANK TRANSFER</span><h2>Continue funding your wallet</h2></div><button className="icon-btn" onClick={()=>setWalletTransferDetails(null)}><X/></button></div><div className="transfer-card"><p>Wallet funding reference: <b>{walletTransferDetails.reference}</b></p><p>Wallet amount to credit: <b>{money(walletTransferDetails.amount)}</b> · Fee: {money(walletTransferDetails.fee)}</p><p>Amount to transfer: <strong>{money(walletTransferDetails.total)}</strong></p><hr/><p>Account name</p><h3>Yakaji Digital Hub</h3><p>Account number</p><h2>3005758913</h2><p>Bank</p><h3>Moniepoint MFB</h3><p className="checkout-note">Use the wallet funding reference above as your transfer narration so the owner can identify your payment.</p><button className="secondary-btn full-btn" onClick={()=>navigator.clipboard?.writeText('3005758913').then(()=>flash('Account number copied.'))}>Copy account number</button></div><p className="checkout-note">Your wallet will be credited only after Yakaji Digital Hub confirms the transfer. This is a wallet funding action only; it does not submit or change any withdrawal request.</p><button className="primary-btn full-btn" onClick={()=>setWalletTransferDetails(null)}>I understand</button></section></div>}
     {manualTransferOrder && <div className="overlay" onClick={()=>setManualTransferOrder(null)}><section className="checkout transfer-instructions" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">MANUAL BANK TRANSFER</span><h2>{manualTransferOrder.creditAmount ? 'Fund your wallet' : 'Complete your payment'}</h2></div><button className="icon-btn" onClick={()=>setManualTransferOrder(null)}><X/></button></div><div className="transfer-card"><p>{manualTransferOrder.creditAmount ? 'Top-up reference:' : 'Order number:'} <b>{manualTransferOrder.orderNumber}</b></p>{manualTransferOrder.creditAmount && <p>Wallet amount to credit: <b>{money(manualTransferOrder.creditAmount)}</b> · Fee: {money(manualTransferOrder.fee || 0)}</p>}<p>Amount to transfer: <strong>{money(manualTransferOrder.total)}</strong></p><hr/><p>Account name</p><h3>Yakaji Digital Hub</h3><p>Account number</p><h2>3005758913</h2><p>Bank</p><h3>Moniepoint MFB</h3>{manualTransferOrder.creditAmount && <p className="checkout-note">Use the top-up reference above as your transfer narration so the owner can identify your payment.</p>}<button className="secondary-btn full-btn" onClick={()=>navigator.clipboard?.writeText('3005758913').then(()=>flash('Account number copied.'))}>Copy account number</button></div><p className="checkout-note">After making the transfer, keep your receipt. Your order or wallet top-up will remain pending until Yakaji Digital Hub confirms the money received. Do not make a second payment for the same reference.</p><button className="primary-btn full-btn" onClick={()=>setManualTransferOrder(null)}>I understand</button></section></div>}
+    {cryptoPaymentOrder && (
+      <div className="overlay" onClick={() => setCryptoPaymentOrder(null)}>
+        <section className="checkout transfer-instructions" onClick={(e) => e.stopPropagation()}>
+          <div className="checkout-head">
+            <div>
+              <span className="eyebrow">USDT / CRYPTOCURRENCY PAYMENT</span>
+              <h2>Send {formatUsdt(cryptoPaymentOrder.totalUsdt)} to complete order</h2>
+            </div>
+            <button className="icon-btn" onClick={() => setCryptoPaymentOrder(null)} aria-label="Close crypto instructions">
+              <X />
+            </button>
+          </div>
+          <div className="transfer-card tabular-nums">
+            <p>Order number: <b>{cryptoPaymentOrder.orderNumber}</b></p>
+            <p>Products subtotal (USDT): <b>{formatUsdt(cryptoPaymentOrder.itemsUsdt)}</b></p>
+            <p>Crypto transfer fee: <b>+{formatUsdt(cryptoPaymentOrder.transferFeeUsdt)}</b> ({money(cryptoPaymentOrder.transferFeeNgn)})</p>
+            <p>Locked exchange rate: <b>1 USDT = ₦{cryptoPaymentOrder.usdtNgnRate.toLocaleString('en-NG')}</b></p>
+            <p>Exact amount to send: <strong>{formatUsdt(cryptoPaymentOrder.totalUsdt)}</strong> ({money(cryptoPaymentOrder.total)})</p>
+            <button
+              type="button"
+              className="secondary-btn full-btn"
+              onClick={() =>
+                navigator.clipboard?.writeText(cryptoPaymentOrder.totalUsdt.toFixed(2)).then(() => flash(`Copied ${cryptoPaymentOrder.totalUsdt.toFixed(2)} USDT.`))
+              }
+            >
+              <Copy size={15} /> Copy exact USDT amount ({cryptoPaymentOrder.totalUsdt.toFixed(2)})
+            </button>
+            <hr />
+            <p>Selected coin &amp; network</p>
+            <h3>{cryptoPaymentOrder.coin} ({cryptoPaymentOrder.symbol}) · {cryptoPaymentOrder.network}</h3>
+            <p>Receiving wallet address</p>
+            <code className="crypto-address-mono crypto-address-modal">{cryptoPaymentOrder.address}</code>
+            {cryptoPaymentOrder.txHash && (
+              <p className="crypto-modal-tx">
+                Submitted TX hash: <b>{cryptoPaymentOrder.txHash}</b>
+              </p>
+            )}
+            <button
+              type="button"
+              className="secondary-btn full-btn"
+              onClick={() =>
+                navigator.clipboard?.writeText(cryptoPaymentOrder.address).then(() => flash('Crypto wallet address copied.'))
+              }
+            >
+              <Copy size={15} /> Copy wallet address
+            </button>
+          </div>
+          {cryptoPaymentOrder.instructions && (
+            <p className="checkout-note">{cryptoPaymentOrder.instructions}</p>
+          )}
+          <p className="checkout-note">
+            Send the exact <b>{formatUsdt(cryptoPaymentOrder.totalUsdt)}</b> (including the <b>{formatUsdt(cryptoPaymentOrder.transferFeeUsdt)}</b> transfer fee) via <b>{cryptoPaymentOrder.symbol}</b> on the <b>{cryptoPaymentOrder.network}</b> network. Your order stays pending until the marketplace owner verifies receipt on-chain.
+          </p>
+          <button type="button" className="primary-btn full-btn" onClick={() => setCryptoPaymentOrder(null)}>
+            I have noted the crypto wallet details
+          </button>
+        </section>
+      </div>
+    )}
     {notificationsOpen && <div className="overlay" onClick={()=>setNotificationsOpen(false)}><section className="checkout notifications-panel" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">YAKAJI DIGITAL HUB</span><h2>Notifications</h2></div><button className="icon-btn" onClick={()=>setNotificationsOpen(false)}><X/></button></div><div className="notification-actions"><button className="secondary-btn" onClick={enablePushNotifications}>Enable device alerts</button>{unreadNotifications>0 && <button className="secondary-btn" onClick={markAllNotificationsRead}>Mark all as read</button>}</div><div className="notification-list">{userNotifications.length ? userNotifications.map(n=><article className={'notification-item '+(n.read?'read':'unread')} key={n.id} onClick={()=>void openNotificationTarget(n)} role="button" tabIndex={0}><span className="notification-dot">{n.kind==='order'?<Package size={16}/>:n.kind==='chat'?<MessageSquare size={16}/>:n.kind==='announcement'?<Megaphone size={16}/>:<Bell size={16}/>}</span><div className="notification-copy"><b>{n.title}</b><p>{n.message}</p><small>{new Date(n.createdAt).toLocaleString()}</small>{!n.read && <button type="button" className="notification-mark-read" onClick={e => { e.stopPropagation(); void markNotificationRead(String(n.id)); }}>Mark as read</button>}</div></article>) : <div className="empty-box"><Bell size={34}/><h3>You're all caught up</h3><p>Order updates, vendor approvals and announcements will appear here.</p></div>}</div></section></div>}
     {chatOpen && <div className="overlay" onClick={()=>setChatOpen(false)}><section className="checkout chat-panel" onClick={e=>e.stopPropagation()}><div className="checkout-head"><div><span className="eyebrow">DIRECT MESSAGING</span><h2>Messages</h2></div><button className="icon-btn" onClick={()=>setChatOpen(false)}><X/></button></div><div className="chat-layout"><aside className="chat-conversations">{chatConversations.length ? chatConversations.map(c=><button key={c.id} className={activeChatId===c.id?'active':''} onClick={()=>setActiveChatId(c.id)}><b>{user?.userId===c.vendorId?c.customerName:c.vendorName}</b><small>{c.productName}</small><span>{c.lastMessage || 'Start the conversation'}</span></button>) : <p className="muted">No conversations yet. Open a product and select “Chat with vendor”.</p>}</aside><div className="chat-thread"><div className="chat-thread-title">{chatConversations.find(c=>c.id===activeChatId)?.productName || 'Select a conversation'}<small>Private messages between customer and vendor</small></div><div className="chat-message-list">{chatMessages.map(m=><div key={m.id} className={'chat-bubble '+(m.senderId===user?.userId?'mine':'theirs')}><b>{m.senderName}</b><p>{m.message}</p><small>{new Date(m.createdAt).toLocaleString()}</small></div>)}</div><form className="chat-compose" onSubmit={sendChatMessage}><input value={chatDraft} onChange={e=>setChatDraft(e.target.value)} placeholder="Write a message..." maxLength={2000} disabled={!activeChatId}/><button className="primary-btn" disabled={!activeChatId || !chatDraft.trim() || chatBusy}><ArrowRight size={16}/></button></form></div></div></section></div>}
     {isAdmin && activeDetailOrder && (

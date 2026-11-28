@@ -2,17 +2,22 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
+  Award,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock3,
+  Download,
   ImagePlus,
   LayoutDashboard,
+  Lock,
   LogIn,
+  Megaphone,
   Package,
   Plus,
   RefreshCw,
   Search,
+  ShieldCheck,
   ShoppingBag,
   Store,
   Tag,
@@ -23,8 +28,20 @@ import {
   Wallet
 } from 'lucide-react';
 import { ShopAvatar, ShopCoverBanner } from './ShopDirectoryView';
+import { VerifiedShopBadge } from './VerifiedShopBadge';
+import { VendorAnnouncementPanel } from './VendorAnnouncementPanel';
+import { VendorVerificationWizard } from './VendorVerificationWizard';
+import { isAnnouncementActive } from '../utils/announcements';
+import {
+  getVendorEntitlements,
+  type VendorVerificationKycPayload,
+  type VendorVerificationRecord,
+  type VerificationBillingCycle,
+  type VerificationPaymentMethod,
+  type VerificationTierId,
+} from '../utils/vendorVerification';
 
-type VendorTab = 'overview' | 'products' | 'orders' | 'coupons' | 'payouts' | 'shop';
+export type VendorTab = 'overview' | 'products' | 'orders' | 'coupons' | 'payouts' | 'announcements' | 'shop' | 'verification';
 
 export type VendorUser = { userId: string; email?: string; name?: string; picture?: string };
 export type VendorAccount = {
@@ -46,6 +63,12 @@ export type VendorAccount = {
   iconUrl?: string;
   coverUrl?: string;
   followerCount?: number;
+  isVerified?: boolean;
+  verificationStatus?: string;
+  verificationTier?: string;
+  verificationTierName?: string;
+  verifiedAt?: string;
+  verifiedUntil?: string;
   status: string;
   createdAt: string;
 };
@@ -165,7 +188,27 @@ export function VendorDashboard({
   uploadVendorShopMedia,
   clearVendorShopMedia,
   shopMediaBusy,
-  openPublicShop
+  openPublicShop,
+  requestedTab,
+  onClearRequestedTab,
+  verification,
+  paystackConfigured,
+  verificationBusy,
+  verificationDocBusy,
+  onStartVerificationPayment,
+  onVerifyVerificationPaystack,
+  onUploadVerificationDocument,
+  onSubmitVerificationKyc,
+  onRefreshVerification,
+  vendorAnnouncements,
+  vendorFollowerCount,
+  vendorAnnouncementForm,
+  setVendorAnnouncementForm,
+  vendorAnnouncementBusy,
+  cancellingVendorAnnouncementId,
+  onPublishVendorAnnouncement,
+  onCancelVendorAnnouncement,
+  onRefreshVendorAnnouncements,
 }: {
   user: VendorUser | null;
   vendor: VendorAccount | null;
@@ -222,6 +265,30 @@ export function VendorDashboard({
   clearVendorShopMedia: (kind: 'icon' | 'cover') => Promise<void>;
   shopMediaBusy: '' | 'icon' | 'cover' | 'profile';
   openPublicShop: (shopId: string) => void;
+  requestedTab?: VendorTab | '';
+  onClearRequestedTab?: () => void;
+  verification: VendorVerificationRecord | null;
+  paystackConfigured: boolean;
+  verificationBusy: boolean;
+  verificationDocBusy: '' | 'cac' | 'national_id';
+  onStartVerificationPayment: (payload: {
+    tierId: VerificationTierId;
+    billingCycle: VerificationBillingCycle;
+    paymentMethod: VerificationPaymentMethod;
+  }) => Promise<any>;
+  onVerifyVerificationPaystack: (reference: string) => Promise<void>;
+  onUploadVerificationDocument: (kind: 'cac' | 'national_id', file: File) => Promise<void>;
+  onSubmitVerificationKyc: (payload: VendorVerificationKycPayload) => Promise<void>;
+  onRefreshVerification: () => Promise<void>;
+  vendorAnnouncements: any[];
+  vendorFollowerCount: number;
+  vendorAnnouncementForm: { title: string; message: string };
+  setVendorAnnouncementForm: (next: { title: string; message: string }) => void;
+  vendorAnnouncementBusy: boolean;
+  cancellingVendorAnnouncementId: string;
+  onPublishVendorAnnouncement: (e: FormEvent) => Promise<void>;
+  onCancelVendorAnnouncement: (id: string) => Promise<void>;
+  onRefreshVendorAnnouncements: () => Promise<void>;
 }) {
   const [activeTab, setActiveTab] = useState<VendorTab>('overview');
   const [productSearch, setProductSearch] = useState('');
@@ -236,6 +303,13 @@ export function VendorDashboard({
       setActiveTab('products');
     }
   }, [editing]);
+
+  useEffect(() => {
+    if (requestedTab) {
+      setActiveTab(requestedTab);
+      onClearRequestedTab?.();
+    }
+  }, [requestedTab, onClearRequestedTab]);
 
   const myProducts = useMemo(
     () => (user ? products.filter(p => p.vendorId === user.userId) : []),
@@ -284,6 +358,71 @@ export function VendorDashboard({
   const activeCouponsCount = vendorCoupons.filter(
     c => c.status === 'active' && new Date(c.expiresAt).getTime() > Date.now()
   ).length;
+
+  const entitlements = useMemo(() => getVendorEntitlements(vendor), [vendor]);
+  const productLimitReached =
+    !isAdmin &&
+    !editing &&
+    entitlements.maxProducts !== null &&
+    myProducts.length >= entitlements.maxProducts;
+  const couponLimitReached =
+    !isAdmin &&
+    entitlements.maxActiveCoupons !== null &&
+    activeCouponsCount >= entitlements.maxActiveCoupons;
+  const effectiveAnalyticsPeriod: 'day' | 'week' | 'month' | 'year' =
+    isAdmin || entitlements.analyticsPeriods.includes(analyticsPeriod) ? analyticsPeriod : 'day';
+  const [lockedPeriodNotice, setLockedPeriodNotice] = useState('');
+
+  const topProductsByRevenue = useMemo(() => {
+    const map = new Map<string, { name: string; units: number; revenue: number }>();
+    for (const order of orders) {
+      if (['Cancelled', 'Refunded', 'Returned'].includes(order.status)) continue;
+      for (const item of order.items) {
+        const key = item.productId || item.name;
+        const prev = map.get(key) || { name: item.name, units: 0, revenue: 0 };
+        map.set(key, {
+          name: item.name || prev.name,
+          units: prev.units + Number(item.quantity || 0),
+          revenue: prev.revenue + Number(item.price || 0) * Number(item.quantity || 0),
+        });
+      }
+    }
+    return [...map.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 5);
+  }, [orders]);
+
+  function exportOrdersCsv() {
+    if (!isAdmin && !entitlements.allowCsvExport) {
+      setActiveTab('verification');
+      return;
+    }
+    const escapeCell = (val: unknown) => {
+      const str = String(val ?? '').replace(/"/g, '""');
+      return `"${str}"`;
+    };
+    const rows = [
+      ['Order Number', 'Date', 'Customer', 'Phone', 'Payment Method', 'Status', 'Items', 'Vendor Total (NGN)'],
+      ...filteredOrders.map(o => [
+        o.orderNumber,
+        new Date(o.createdAt).toISOString(),
+        o.customerName,
+        o.phone,
+        o.paymentMethod,
+        o.status,
+        o.items.map(i => `${i.name} x${i.quantity}`).join('; '),
+        Number(o.vendorTotal || o.items.reduce((sum, i) => sum + i.price * i.quantity, 0)),
+      ]),
+    ];
+    const csv = rows.map(row => row.map(escapeCell).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(vendor?.shopName || 'shop').toLowerCase().replace(/[^a-z0-9]+/g, '-')}-orders.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
 
   function openNewProductEditor() {
     startNewProduct();
@@ -425,9 +564,17 @@ export function VendorDashboard({
                 <ShopAvatar shopName={vendor.shopName} iconUrl={vendor.iconUrl} size="md" />
                 <div>
                   <span className="eyebrow">SELLER CENTRE · {vendor.shopName.toUpperCase()}</span>
-                  <h1>{vendor.shopName}</h1>
+                  <h1 className="shop-title-verified-row">
+                    <span>{vendor.shopName}</span>
+                    <VerifiedShopBadge
+                      verified={vendor.isVerified}
+                      tierId={vendor.verificationTier}
+                      size="lg"
+                      showLabel
+                    />
+                  </h1>
                   <p>
-                    Verified Storefront · {approvedProductCount} live listing{approvedProductCount === 1 ? '' : 's'} ·{' '}
+                    {vendor.isVerified ? 'Verified Business Storefront' : 'Approved Storefront'} · {approvedProductCount} live listing{approvedProductCount === 1 ? '' : 's'} ·{' '}
                     {activeOrdersCount} active order{activeOrdersCount === 1 ? '' : 's'} ·{' '}
                     {Number(vendor.followerCount || 0).toLocaleString()} follower{Number(vendor.followerCount || 0) === 1 ? '' : 's'}
                   </p>
@@ -456,6 +603,14 @@ export function VendorDashboard({
               </button>
               <button
                 type="button"
+                className={activeTab === 'verification' ? 'active' : ''}
+                onClick={() => setActiveTab('verification')}
+              >
+                <ShieldCheck size={15} /> Verify Shop
+                <VerifiedShopBadge verified={vendor.isVerified} tierId={vendor.verificationTier} size="xs" />
+              </button>
+              <button
+                type="button"
                 className={activeTab === 'shop' ? 'active' : ''}
                 onClick={() => setActiveTab('shop')}
               >
@@ -481,6 +636,13 @@ export function VendorDashboard({
                 onClick={() => setActiveTab('coupons')}
               >
                 <Tag size={15} /> Coupons ({activeCouponsCount})
+              </button>
+              <button
+                type="button"
+                className={activeTab === 'announcements' ? 'active' : ''}
+                onClick={() => setActiveTab('announcements')}
+              >
+                <Megaphone size={15} /> Follower Alerts ({vendorAnnouncements.filter(isAnnouncementActive).length})
               </button>
               <button
                 type="button"
@@ -525,8 +687,76 @@ export function VendorDashboard({
             </article>
           </section>
 
+          <section className="vendor-plan-strip tabular-nums" aria-label="Active shop plan and tool limits">
+            <div className="vendor-plan-strip-head">
+              <div>
+                <span className="eyebrow">ACTIVE SHOP PLAN · TOOL ACCESS</span>
+                <b className="vendor-plan-strip-title">
+                  <span>{entitlements.planName}</span>
+                  <VerifiedShopBadge verified={vendor.isVerified} tierId={vendor.verificationTier} size="sm" />
+                </b>
+              </div>
+              <button type="button" className="secondary-btn" onClick={() => setActiveTab('verification')}>
+                <ShieldCheck size={14} /> {entitlements.isPaidTier ? 'Compare / Upgrade Plan (Save 20% Yearly)' : 'Upgrade Plan · From ₦3,000/mo'}
+              </button>
+            </div>
+            <div className="vendor-plan-quotas">
+              <div>
+                <small>Product catalog</small>
+                <b>{myProducts.length} / {entitlements.maxProducts === null ? 'Unlimited' : entitlements.maxProducts}</b>
+              </div>
+              <div>
+                <small>Active coupons</small>
+                <b>
+                  {entitlements.maxActiveCoupons === 0
+                    ? 'Locked (Starter+)'
+                    : `${activeCouponsCount} / ${entitlements.maxActiveCoupons === null ? 'Unlimited' : entitlements.maxActiveCoupons}`}
+                </b>
+              </div>
+              <div>
+                <small>Product media</small>
+                <b>
+                  Up to {entitlements.maxProductImages} photos · {entitlements.allowProductVideos ? 'Videos on' : 'No video'}
+                </b>
+              </div>
+              <div>
+                <small>Affiliate recruitment</small>
+                <b>
+                  {entitlements.maxAffiliateCommissionPercent === 0
+                    ? 'Locked (Plus+)'
+                    : `Up to ${entitlements.maxAffiliateCommissionPercent}%`}
+                </b>
+              </div>
+              <div>
+                <small>Storefront &amp; exports</small>
+                <b>
+                  {entitlements.allowCoverBanner ? 'Cover + CSV' : 'Icon only (No CSV)'}
+                </b>
+              </div>
+            </div>
+          </section>
+
           {activeTab === 'overview' && (
             <>
+              {!vendor.isVerified && (
+                <section className="panel verify-overview-callout">
+                  <div className="verify-overview-copy">
+                    <span className="eyebrow">UNLOCK PAID VENDOR TOOLS &amp; BLUE TICK</span>
+                    <h3>Verify {vendor.shopName} — Starter from ₦3,000/month (₦28,800/year · Save 20%)</h3>
+                    <p>
+                      Free shops are limited to 5 products with no coupons, discounts, or cover banner. Upgrade to <b>Starter</b> (₦3,000/mo), <b>Plus</b>, <b>Premium</b>, or <b>Pro Max</b>, attach your CAC &amp; National ID, and unlock full seller tools plus your blue verified tick.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={() => setActiveTab('verification')}
+                  >
+                    <ShieldCheck size={16} /> Compare Plans &amp; Verify
+                  </button>
+                </section>
+              )}
+
               <div className="seller-overview-grid">
                 <section className="panel">
                   <div className="panel-title">
@@ -537,39 +767,64 @@ export function VendorDashboard({
                     </div>
                   </div>
                   <div className="profit-cal-tabs seller-period-tabs" role="tablist" aria-label="Sales report period">
-                    {(['day', 'week', 'month', 'year'] as const).map(period => (
-                      <button
-                        key={period}
-                        type="button"
-                        className={analyticsPeriod === period ? 'active' : ''}
-                        onClick={() => setAnalyticsPeriod(period)}
-                      >
-                        {period === 'day'
+                    {(['day', 'week', 'month', 'year'] as const).map(period => {
+                      const allowed = isAdmin || entitlements.analyticsPeriods.includes(period);
+                      const label =
+                        period === 'day'
                           ? 'Today'
                           : period === 'week'
                             ? 'This week'
                             : period === 'month'
                               ? 'This month'
-                              : 'This year'}
-                      </button>
-                    ))}
+                              : 'This year';
+                      return (
+                        <button
+                          key={period}
+                          type="button"
+                          className={(effectiveAnalyticsPeriod === period ? 'active' : '') + (!allowed ? ' is-locked-tab' : '')}
+                          onClick={() => {
+                            if (!allowed) {
+                              setLockedPeriodNotice(
+                                period === 'year'
+                                  ? 'Full-year analytics unlock on Plus (₦5,000/mo), Premium, and Pro Max.'
+                                  : 'Weekly & monthly analytics unlock on Starter (₦3,000/mo) and above.'
+                              );
+                              return;
+                            }
+                            setLockedPeriodNotice('');
+                            setAnalyticsPeriod(period);
+                          }}
+                        >
+                          {!allowed && <Lock size={12} />} {label}
+                        </button>
+                      );
+                    })}
                   </div>
+                  {lockedPeriodNotice && (
+                    <div className="vendor-gate-inline">
+                      <Lock size={14} />
+                      <span>{lockedPeriodNotice}</span>
+                      <button type="button" className="secondary-btn" onClick={() => setActiveTab('verification')}>
+                        Upgrade plan
+                      </button>
+                    </div>
+                  )}
                   <div className="seller-metric-grid tabular-nums">
                     <div>
                       <small>Orders</small>
-                      <b>{vendorReports?.[analyticsPeriod]?.orders || 0}</b>
+                      <b>{vendorReports?.[effectiveAnalyticsPeriod]?.orders || 0}</b>
                     </div>
                     <div>
                       <small>Units sold</small>
-                      <b>{vendorReports?.[analyticsPeriod]?.unitsSold || 0}</b>
+                      <b>{vendorReports?.[effectiveAnalyticsPeriod]?.unitsSold || 0}</b>
                     </div>
                     <div>
                       <small>Gross sales</small>
-                      <b>{money(vendorReports?.[analyticsPeriod]?.grossSales || 0)}</b>
+                      <b>{money(vendorReports?.[effectiveAnalyticsPeriod]?.grossSales || 0)}</b>
                     </div>
                     <div>
                       <small>Completed earnings</small>
-                      <strong>{money(vendorReports?.[analyticsPeriod]?.completedEarnings || 0)}</strong>
+                      <strong>{money(vendorReports?.[effectiveAnalyticsPeriod]?.completedEarnings || 0)}</strong>
                     </div>
                   </div>
                 </section>
@@ -609,6 +864,53 @@ export function VendorDashboard({
                   </div>
                 </section>
               </div>
+
+              <section className="panel">
+                <div className="panel-title">
+                  <div>
+                    <span className="eyebrow">PRODUCT INTELLIGENCE · PREMIUM &amp; PRO MAX</span>
+                    <h2>Top performing products by revenue</h2>
+                    <p>Identify your highest-earning items across customer orders.</p>
+                  </div>
+                  {(isAdmin || entitlements.allowCsvExport) && (
+                    <button type="button" className="secondary-btn" onClick={exportOrdersCsv}>
+                      <Download size={14} /> Export Orders CSV
+                    </button>
+                  )}
+                </div>
+                {!(isAdmin || entitlements.allowTopProductsAnalytics) ? (
+                  <div className="vendor-locked-card">
+                    <Award size={26} />
+                    <div>
+                      <b>Unlock Top Product Revenue Analytics on Premium &amp; Pro Max</b>
+                      <small>
+                        See your top-earning products, unit velocity, and revenue share on Premium (₦8,500/mo) and Pro Max (₦15,000/mo) — save 20% with 1-Year Annual billing.
+                      </small>
+                    </div>
+                    <button type="button" className="primary-btn" onClick={() => setActiveTab('verification')}>
+                      Upgrade to Premium
+                    </button>
+                  </div>
+                ) : topProductsByRevenue.length ? (
+                  <div className="compact-order-list tabular-nums">
+                    {topProductsByRevenue.map((item, idx) => (
+                      <div className="manage-row" key={item.name + idx}>
+                        <div className="manage-main">
+                          <b>#{idx + 1} · {item.name}</b>
+                          <small>{item.units} unit{item.units === 1 ? '' : 's'} ordered</small>
+                        </div>
+                        <strong>{money(item.revenue)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="chart-empty compact">
+                    <TrendingUp size={24} />
+                    <b>No product sales recorded yet</b>
+                    <small>Top-selling items appear here once customers place orders.</small>
+                  </div>
+                )}
+              </section>
 
               <div className="seller-overview-grid">
                 <section className="panel">
@@ -693,9 +995,11 @@ export function VendorDashboard({
               <section className="panel" id="product-editor">
                 <div className="panel-title">
                   <div>
-                    <span className="eyebrow">PRODUCT STUDIO</span>
+                    <span className="eyebrow">PRODUCT STUDIO · {entitlements.planName.toUpperCase()}</span>
                     <h2>{editing ? 'Edit product listing' : 'Publish a new product'}</h2>
-                    <p>Configure pricing, timed discounts, inventory variations, affiliate commission, and media.</p>
+                    <p className="tabular-nums">
+                      Catalog usage: <b>{myProducts.length} / {entitlements.maxProducts === null ? 'Unlimited' : entitlements.maxProducts}</b> products · Up to {entitlements.maxProductImages} photos{entitlements.allowProductVideos ? ' + promo videos' : ' (videos on Plus+)'}.
+                    </p>
                   </div>
                   {editing && (
                     <button type="button" className="secondary-btn" onClick={startNewProduct}>
@@ -703,11 +1007,30 @@ export function VendorDashboard({
                     </button>
                   )}
                 </div>
+
+                {productLimitReached && (
+                  <div className="vendor-locked-card" role="alert">
+                    <Lock size={24} />
+                    <div>
+                      <b>Catalog limit reached on {entitlements.planName} ({myProducts.length}/{entitlements.maxProducts})</b>
+                      <small>
+                        {entitlements.planId === 'free'
+                          ? 'Free shops can publish up to 5 products. Upgrade to Starter (₦3,000/mo · 20 products), Plus (60), Premium (200), or Pro Max (Unlimited).'
+                          : `Upgrade to the next verification tier in Verify Shop to unlock more listings.`}
+                      </small>
+                    </div>
+                    <button type="button" className="primary-btn" onClick={() => setActiveTab('verification')}>
+                      Upgrade plan
+                    </button>
+                  </div>
+                )}
+
                 <form className="product-form" onSubmit={saveProduct}>
                   <label>
                     Product name
                     <input
                       required
+                      disabled={productLimitReached}
                       value={draft.name}
                       onChange={e => setDraft({ ...draft, name: e.target.value })}
                       placeholder="Enter product name"
@@ -715,7 +1038,7 @@ export function VendorDashboard({
                   </label>
                   <label>
                     Category
-                    <select value={draft.category} onChange={e => setDraft({ ...draft, category: e.target.value })}>
+                    <select disabled={productLimitReached} value={draft.category} onChange={e => setDraft({ ...draft, category: e.target.value })}>
                       {categories.filter(x => x !== 'All').map(x => <option key={x}>{x}</option>)}
                     </select>
                   </label>
@@ -723,6 +1046,7 @@ export function VendorDashboard({
                     Standard price (₦)
                     <input
                       required
+                      disabled={productLimitReached}
                       type="number"
                       min="1"
                       value={draft.price}
@@ -730,17 +1054,21 @@ export function VendorDashboard({
                     />
                   </label>
                   <label>
-                    Discount method
+                    Discount method {!isAdmin && !entitlements.allowProductDiscounts && '(Starter+)'}
                     <select
-                      value={draft.discountMode}
+                      disabled={productLimitReached || (!isAdmin && !entitlements.allowProductDiscounts)}
+                      value={!isAdmin && !entitlements.allowProductDiscounts ? 'none' : draft.discountMode}
                       onChange={e => setDraft({ ...draft, discountMode: e.target.value, discountValue: '' })}
                     >
                       <option value="none">No discount</option>
                       <option value="manual">Enter discount price</option>
                       <option value="percentage">Enter discount percentage</option>
                     </select>
+                    {!isAdmin && !entitlements.allowProductDiscounts && (
+                      <small className="verify-inline-warn">Product sale discounts unlock on Starter (₦3,000/mo).</small>
+                    )}
                   </label>
-                  {draft.discountMode !== 'none' && (
+                  {(isAdmin || entitlements.allowProductDiscounts) && draft.discountMode !== 'none' && (
                     <label>
                       {draft.discountMode === 'manual' ? 'Discount price (₦)' : 'Discount percentage (%)'}
                       <input
@@ -759,20 +1087,25 @@ export function VendorDashboard({
                       </small>
                     </label>
                   )}
-                  {draft.discountMode !== 'none' && (
+                  {(isAdmin || entitlements.allowProductDiscounts) && draft.discountMode !== 'none' && (
                     <>
                       <label>
-                        Discount starts (optional)
+                        Discount starts {!isAdmin && !entitlements.allowScheduledFlashSales ? '(Plus+)' : '(optional)'}
                         <input
                           type="datetime-local"
+                          disabled={!isAdmin && !entitlements.allowScheduledFlashSales}
                           value={draft.discountStartAt}
                           onChange={e => setDraft({ ...draft, discountStartAt: e.target.value })}
                         />
+                        {!isAdmin && !entitlements.allowScheduledFlashSales && (
+                          <small className="verify-inline-warn">Timed flash-sale scheduler unlocks on Plus (₦5,000/mo).</small>
+                        )}
                       </label>
                       <label>
-                        Discount ends (optional)
+                        Discount ends {!isAdmin && !entitlements.allowScheduledFlashSales ? '(Plus+)' : '(optional)'}
                         <input
                           type="datetime-local"
+                          disabled={!isAdmin && !entitlements.allowScheduledFlashSales}
                           value={draft.discountEndAt}
                           onChange={e => setDraft({ ...draft, discountEndAt: e.target.value })}
                         />
@@ -783,6 +1116,7 @@ export function VendorDashboard({
                     Available stock
                     <input
                       required
+                      disabled={productLimitReached}
                       type="number"
                       min="0"
                       value={draft.stock}
@@ -792,6 +1126,7 @@ export function VendorDashboard({
                   <label>
                     Product label
                     <input
+                      disabled={productLimitReached}
                       value={draft.tag}
                       onChange={e => setDraft({ ...draft, tag: e.target.value })}
                       placeholder="New / Popular / Sale"
@@ -800,23 +1135,31 @@ export function VendorDashboard({
                   <label>
                     Options / variations
                     <input
+                      disabled={productLimitReached}
                       value={draft.options}
                       onChange={e => setDraft({ ...draft, options: e.target.value })}
                       placeholder="Small, Medium, Large or Basic, Pro"
                     />
                   </label>
                   <label>
-                    Affiliate commission (%)
+                    Affiliate commission (%) {!isAdmin && entitlements.maxAffiliateCommissionPercent === 0 && '(Plus+)'}
                     <input
                       type="number"
                       required
                       min="0"
-                      max="25"
+                      max={isAdmin ? 25 : entitlements.maxAffiliateCommissionPercent}
                       step="1"
-                      value={draft.affiliateCommissionPercent}
+                      disabled={productLimitReached || (!isAdmin && entitlements.maxAffiliateCommissionPercent === 0)}
+                      value={!isAdmin && entitlements.maxAffiliateCommissionPercent === 0 ? '0' : draft.affiliateCommissionPercent}
                       onChange={e => setDraft({ ...draft, affiliateCommissionPercent: e.target.value })}
                     />
-                    <small>Choose 0% to disable affiliate payouts, or 5%–25% for partner promotions.</small>
+                    <small>
+                      {isAdmin || entitlements.maxAffiliateCommissionPercent >= 25
+                        ? 'Choose 0% to disable affiliate payouts, or 5%–25% for partner promotions.'
+                        : entitlements.maxAffiliateCommissionPercent > 0
+                          ? `Plus supports 0% or 5%–${entitlements.maxAffiliateCommissionPercent}%. Upgrade to Premium/Pro Max for up to 25%.`
+                          : 'Affiliate partner recruitment unlocks on Plus (up to 15%) and Premium/Pro Max (up to 25%).'}
+                    </small>
                   </label>
                   {isAdmin && (
                     <label>
@@ -837,6 +1180,7 @@ export function VendorDashboard({
                     Description
                     <textarea
                       required
+                      disabled={productLimitReached}
                       rows={3}
                       value={draft.description}
                       onChange={e => setDraft({ ...draft, description: e.target.value })}
@@ -844,14 +1188,22 @@ export function VendorDashboard({
                     />
                   </label>
                   <label className="full-field upload-field">
-                    <span><ImagePlus /> Product images and videos (optional when editing)</span>
+                    <span>
+                      <ImagePlus /> Product {isAdmin || entitlements.allowProductVideos ? 'images and videos' : 'images'} (optional when editing)
+                    </span>
                     <input
                       type="file"
                       multiple
-                      accept="image/*,video/mp4,video/webm,video/quicktime"
+                      disabled={productLimitReached}
+                      accept={isAdmin || entitlements.allowProductVideos ? 'image/*,video/mp4,video/webm,video/quicktime' : 'image/*'}
                       onChange={e => setSelectedFiles(Array.from(e.target.files || []))}
                     />
-                    <small>Images up to 8MB and videos up to 30MB each. Existing media stays unless removed.</small>
+                    <small>
+                      {entitlements.planName}: up to {entitlements.maxProductImages} images (max 8MB each)
+                      {isAdmin || entitlements.allowProductVideos
+                        ? ' and promo videos up to 30MB each.'
+                        : ' · Promo video uploads unlock on Plus (₦5,000/mo).'}
+                    </small>
                     {selectedFiles.length > 0 && <b>{selectedFiles.length} new file(s) selected</b>}
                     {draft.images.length + draft.videos.length > 0 && (
                       <small>{draft.images.length} saved image(s), {draft.videos.length} saved video(s)</small>
@@ -881,7 +1233,7 @@ export function VendorDashboard({
                       </div>
                     </div>
                   )}
-                  <button className="primary-btn" disabled={busy}>
+                  <button className="primary-btn" disabled={busy || productLimitReached}>
                     {busy ? 'Saving product...' : editing ? 'Save changes' : 'Publish product'}{' '}
                     <UploadCloud size={17} />
                   </button>
@@ -976,9 +1328,22 @@ export function VendorDashboard({
                   <h2>My customer orders ({orders.length})</h2>
                   <p>View customer and delivery details. Only marketplace operations can approve, ship, or complete order stages.</p>
                 </div>
-                <button type="button" className="secondary-btn" onClick={() => void refreshVendor()}>
-                  Refresh orders
-                </button>
+                <div className="seller-header-actions">
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={exportOrdersCsv}
+                  >
+                    {isAdmin || entitlements.allowCsvExport ? (
+                      <><Download size={14} /> Export CSV</>
+                    ) : (
+                      <><Lock size={14} /> Export CSV (Starter+)</>
+                    )}
+                  </button>
+                  <button type="button" className="secondary-btn" onClick={() => void refreshVendor()}>
+                    Refresh orders
+                  </button>
+                </div>
               </div>
 
               <div className="admin-order-toolbar">
@@ -1102,116 +1467,162 @@ export function VendorDashboard({
                 <div>
                   <span className="eyebrow">PROMOTIONS &amp; DISCOUNTS</span>
                   <h2>My product coupons</h2>
-                  <p>Create discount codes customers can apply at checkout with exact start and expiry schedules.</p>
+                  <p>
+                    {entitlements.maxActiveCoupons === 0
+                      ? 'Checkout discount codes unlock starting on Starter (₦3,000/month).'
+                      : `Create discount codes customers can apply at checkout (${activeCouponsCount} / ${entitlements.maxActiveCoupons === null ? 'Unlimited' : entitlements.maxActiveCoupons} active).`}
+                  </p>
                 </div>
+                {entitlements.maxActiveCoupons !== 0 && (
+                  <span className="verify-paid-callout tabular-nums">
+                    {activeCouponsCount} / {entitlements.maxActiveCoupons === null ? 'Unlimited' : entitlements.maxActiveCoupons} active
+                  </span>
+                )}
               </div>
 
-              <form className="product-form" onSubmit={saveVendorCoupon}>
-                <label>
-                  Coupon code
-                  <input
-                    required
-                    minLength={3}
-                    maxLength={32}
-                    value={couponDraft.code}
-                    onChange={e =>
-                      setCouponDraft({
-                        ...couponDraft,
-                        code: e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
-                      })
-                    }
-                    placeholder="e.g. SAVE10"
-                  />
-                </label>
-                <label>
-                  Discount type
-                  <select
-                    value={couponDraft.discountType}
-                    onChange={e => setCouponDraft({ ...couponDraft, discountType: e.target.value })}
-                  >
-                    <option value="percentage">Percentage (%)</option>
-                    <option value="fixed">Fixed amount (₦)</option>
-                  </select>
-                </label>
-                <label>
-                  Discount value
-                  <input
-                    required
-                    type="number"
-                    min="1"
-                    max={couponDraft.discountType === 'percentage' ? 100 : 10000000}
-                    value={couponDraft.discountValue}
-                    onChange={e => setCouponDraft({ ...couponDraft, discountValue: e.target.value })}
-                  />
-                </label>
-                <label>
-                  Products covered
-                  <select
-                    multiple
-                    value={couponDraft.productIds}
-                    onChange={e =>
-                      setCouponDraft({
-                        ...couponDraft,
-                        productIds: Array.from(e.target.selectedOptions).map(option => option.value)
-                      })
-                    }
-                  >
-                    {myProducts.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                  </select>
-                  <small>Leave unselected to apply to all your products.</small>
-                </label>
-                <label>
-                  Minimum order amount (₦)
-                  <input
-                    type="number"
-                    min="0"
-                    value={couponDraft.minOrderAmount}
-                    onChange={e => setCouponDraft({ ...couponDraft, minOrderAmount: e.target.value })}
-                    placeholder="0 = no minimum"
-                  />
-                </label>
-                <label>
-                  Maximum discount (₦)
-                  <input
-                    type="number"
-                    min="0"
-                    value={couponDraft.maxDiscount}
-                    onChange={e => setCouponDraft({ ...couponDraft, maxDiscount: e.target.value })}
-                    placeholder="0 = no cap"
-                  />
-                </label>
-                <label>
-                  Maximum uses
-                  <input
-                    type="number"
-                    min="0"
-                    step="1"
-                    value={couponDraft.usageLimit}
-                    onChange={e => setCouponDraft({ ...couponDraft, usageLimit: e.target.value })}
-                  />
-                  <small>Enter 0 for unlimited uses.</small>
-                </label>
-                <label>
-                  Starts at (optional)
-                  <input
-                    type="datetime-local"
-                    value={couponDraft.startsAt}
-                    onChange={e => setCouponDraft({ ...couponDraft, startsAt: e.target.value })}
-                  />
-                </label>
-                <label>
-                  Expiry date and time
-                  <input
-                    required
-                    type="datetime-local"
-                    value={couponDraft.expiresAt}
-                    onChange={e => setCouponDraft({ ...couponDraft, expiresAt: e.target.value })}
-                  />
-                </label>
-                <button className="primary-btn" disabled={busy}>
-                  {busy ? 'Creating coupon...' : 'Create coupon'}
-                </button>
-              </form>
+              {!isAdmin && entitlements.maxActiveCoupons === 0 ? (
+                <div className="vendor-locked-card">
+                  <Lock size={26} />
+                  <div>
+                    <b>Checkout coupons are locked on Free Shop</b>
+                    <small>
+                      Upgrade to <b>Starter (₦3,000/mo · 3 coupons)</b>, <b>Plus (15 coupons)</b>, <b>Premium (50 coupons)</b>, or <b>Pro Max (Unlimited)</b> — save 20% with a 1-Year Annual plan.
+                    </small>
+                  </div>
+                  <button type="button" className="primary-btn" onClick={() => setActiveTab('verification')}>
+                    <ShieldCheck size={15} /> Unlock Coupons on Starter
+                  </button>
+                </div>
+              ) : (
+                <>
+                  {couponLimitReached && (
+                    <div className="vendor-gate-inline">
+                      <Lock size={14} />
+                      <span>
+                        Active coupon cap reached ({activeCouponsCount}/{entitlements.maxActiveCoupons}) on {entitlements.planName}. Deactivate an old coupon or upgrade.
+                      </span>
+                      <button type="button" className="secondary-btn" onClick={() => setActiveTab('verification')}>
+                        Upgrade plan
+                      </button>
+                    </div>
+                  )}
+                  <form className="product-form" onSubmit={saveVendorCoupon}>
+                    <label>
+                      Coupon code
+                      <input
+                        required
+                        disabled={couponLimitReached}
+                        minLength={3}
+                        maxLength={32}
+                        value={couponDraft.code}
+                        onChange={e =>
+                          setCouponDraft({
+                            ...couponDraft,
+                            code: e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
+                          })
+                        }
+                        placeholder="e.g. SAVE10"
+                      />
+                    </label>
+                    <label>
+                      Discount type
+                      <select
+                        disabled={couponLimitReached}
+                        value={couponDraft.discountType}
+                        onChange={e => setCouponDraft({ ...couponDraft, discountType: e.target.value })}
+                      >
+                        <option value="percentage">Percentage (%)</option>
+                        <option value="fixed">Fixed amount (₦)</option>
+                      </select>
+                    </label>
+                    <label>
+                      Discount value
+                      <input
+                        required
+                        disabled={couponLimitReached}
+                        type="number"
+                        min="1"
+                        max={couponDraft.discountType === 'percentage' ? 100 : 10000000}
+                        value={couponDraft.discountValue}
+                        onChange={e => setCouponDraft({ ...couponDraft, discountValue: e.target.value })}
+                      />
+                    </label>
+                    <label>
+                      Products covered
+                      <select
+                        multiple
+                        disabled={couponLimitReached}
+                        value={couponDraft.productIds}
+                        onChange={e =>
+                          setCouponDraft({
+                            ...couponDraft,
+                            productIds: Array.from(e.target.selectedOptions).map(option => option.value)
+                          })
+                        }
+                      >
+                        {myProducts.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                      <small>Leave unselected to apply to all your products.</small>
+                    </label>
+                    <label>
+                      Minimum order amount (₦)
+                      <input
+                        type="number"
+                        disabled={couponLimitReached}
+                        min="0"
+                        value={couponDraft.minOrderAmount}
+                        onChange={e => setCouponDraft({ ...couponDraft, minOrderAmount: e.target.value })}
+                        placeholder="0 = no minimum"
+                      />
+                    </label>
+                    <label>
+                      Maximum discount (₦)
+                      <input
+                        type="number"
+                        disabled={couponLimitReached}
+                        min="0"
+                        value={couponDraft.maxDiscount}
+                        onChange={e => setCouponDraft({ ...couponDraft, maxDiscount: e.target.value })}
+                        placeholder="0 = no cap"
+                      />
+                    </label>
+                    <label>
+                      Maximum uses
+                      <input
+                        type="number"
+                        disabled={couponLimitReached}
+                        min="0"
+                        step="1"
+                        value={couponDraft.usageLimit}
+                        onChange={e => setCouponDraft({ ...couponDraft, usageLimit: e.target.value })}
+                      />
+                      <small>Enter 0 for unlimited uses.</small>
+                    </label>
+                    <label>
+                      Starts at (optional)
+                      <input
+                        type="datetime-local"
+                        disabled={couponLimitReached}
+                        value={couponDraft.startsAt}
+                        onChange={e => setCouponDraft({ ...couponDraft, startsAt: e.target.value })}
+                      />
+                    </label>
+                    <label>
+                      Expiry date and time
+                      <input
+                        required
+                        disabled={couponLimitReached}
+                        type="datetime-local"
+                        value={couponDraft.expiresAt}
+                        onChange={e => setCouponDraft({ ...couponDraft, expiresAt: e.target.value })}
+                      />
+                    </label>
+                    <button className="primary-btn" disabled={busy || couponLimitReached}>
+                      {busy ? 'Creating coupon...' : 'Create coupon'}
+                    </button>
+                  </form>
+                </>
+              )}
 
               <h3>Coupons you created ({vendorCoupons.length})</h3>
               {vendorCoupons.length ? (
@@ -1368,51 +1779,74 @@ export function VendorDashboard({
               <div className="panel-title">
                 <div>
                   <span className="eyebrow">STOREFRONT BRANDING &amp; IDENTITY</span>
-                  <h2>Edit shop profile, icon &amp; cover banner</h2>
+                  <h2 className="shop-title-verified-row">
+                    <span>Edit shop profile, icon &amp; cover banner</span>
+                    <VerifiedShopBadge
+                      verified={vendor.isVerified}
+                      tierId={vendor.verificationTier}
+                      size="md"
+                      showLabel
+                    />
+                  </h2>
                   <p>Customize how customers see your storefront when browsing Vendor Shops and following your brand.</p>
                 </div>
-                <button type="button" className="secondary-btn" onClick={() => openPublicShop(vendor.id)}>
-                  <Store size={15} /> Preview public storefront
-                </button>
+                <div className="seller-header-actions">
+                  <button type="button" className="secondary-btn" onClick={() => setActiveTab('verification')}>
+                    <ShieldCheck size={15} /> {vendor.isVerified ? 'Verification status' : 'Verify shop & get Blue Tick'}
+                  </button>
+                  <button type="button" className="secondary-btn" onClick={() => openPublicShop(vendor.id)}>
+                    <Store size={15} /> Preview public storefront
+                  </button>
+                </div>
               </div>
 
               <div className="shop-media-editor-grid">
                 <div className="shop-media-card">
                   <div className="shop-media-card-head">
                     <div>
-                      <b>Shop cover picture</b>
+                      <b>Shop cover picture {!isAdmin && !entitlements.allowCoverBanner && '(Starter+)'}</b>
                       <small>Wide banner shown at the top of your shop storefront and directory card (JPG, PNG or WebP · up to 8MB)</small>
                     </div>
                   </div>
                   <div className="shop-cover-preview-frame">
                     <ShopCoverBanner shopName={vendorProfileForm.shopName || vendor.shopName} coverUrl={vendor.coverUrl} height="card" />
                   </div>
-                  <div className="shop-media-card-actions">
-                    <label className="secondary-btn shop-upload-btn">
-                      <ImagePlus size={15} />
-                      <span>{shopMediaBusy === 'cover' ? 'Uploading cover...' : vendor.coverUrl ? 'Change cover image' : 'Upload cover image'}</span>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        disabled={Boolean(shopMediaBusy)}
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          e.target.value = '';
-                          if (file) void uploadVendorShopMedia('cover', file);
-                        }}
-                      />
-                    </label>
-                    {vendor.coverUrl && (
-                      <button
-                        type="button"
-                        className="danger-icon"
-                        disabled={Boolean(shopMediaBusy)}
-                        onClick={() => void clearVendorShopMedia('cover')}
-                      >
-                        <Trash2 size={14} /> Remove cover
+                  {!isAdmin && !entitlements.allowCoverBanner ? (
+                    <div className="vendor-gate-inline">
+                      <Lock size={14} />
+                      <span>Custom cover banners unlock on Starter (₦3,000/mo or ₦28,800/yr). Shop icon uploads are free.</span>
+                      <button type="button" className="secondary-btn" onClick={() => setActiveTab('verification')}>
+                        Unlock on Starter
                       </button>
-                    )}
-                  </div>
+                    </div>
+                  ) : (
+                    <div className="shop-media-card-actions">
+                      <label className="secondary-btn shop-upload-btn">
+                        <ImagePlus size={15} />
+                        <span>{shopMediaBusy === 'cover' ? 'Uploading cover...' : vendor.coverUrl ? 'Change cover image' : 'Upload cover image'}</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          disabled={Boolean(shopMediaBusy)}
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = '';
+                            if (file) void uploadVendorShopMedia('cover', file);
+                          }}
+                        />
+                      </label>
+                      {vendor.coverUrl && (
+                        <button
+                          type="button"
+                          className="danger-icon"
+                          disabled={Boolean(shopMediaBusy)}
+                          onClick={() => void clearVendorShopMedia('cover')}
+                        >
+                          <Trash2 size={14} /> Remove cover
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div className="shop-media-card">
@@ -1562,6 +1996,40 @@ export function VendorDashboard({
                 </button>
               </form>
             </section>
+          )}
+
+          {activeTab === 'announcements' && (
+            <VendorAnnouncementPanel
+              vendorId={vendor.id}
+              shopName={vendor.shopName}
+              followerCount={Number(vendorFollowerCount || vendor.followerCount || 0)}
+              announcements={vendorAnnouncements}
+              form={vendorAnnouncementForm}
+              setForm={setVendorAnnouncementForm}
+              busy={vendorAnnouncementBusy}
+              cancellingId={cancellingVendorAnnouncementId}
+              onPublish={onPublishVendorAnnouncement}
+              onCancel={onCancelVendorAnnouncement}
+              onRefresh={onRefreshVendorAnnouncements}
+              onOpenPublicShop={() => openPublicShop(vendor.id)}
+            />
+          )}
+
+          {activeTab === 'verification' && (
+            <VendorVerificationWizard
+              vendor={vendor}
+              verification={verification}
+              paystackConfigured={paystackConfigured}
+              walletBalance={Number(wallet?.walletBalance ?? 0)}
+              money={money}
+              onStartPayment={onStartVerificationPayment}
+              onVerifyPaystack={onVerifyVerificationPaystack}
+              onUploadDocument={onUploadVerificationDocument}
+              onSubmitKyc={onSubmitVerificationKyc}
+              onRefresh={onRefreshVerification}
+              busy={verificationBusy}
+              docUploadBusy={verificationDocBusy}
+            />
           )}
         </>
       )}

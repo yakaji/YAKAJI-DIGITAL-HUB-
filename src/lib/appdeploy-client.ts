@@ -602,6 +602,38 @@ export const api = {
   delete: <T = any>(url: string) => request<T>('DELETE', url),
 };
 
+export async function fetchProtectedBlobUrl(
+  url: string
+): Promise<{ objectUrl: string; contentType: string }> {
+  const headers: Record<string, string> = {
+    'X-Requested-With': 'yakaji-web',
+  };
+  if (inMemoryToken) {
+    headers['Authorization'] = `Bearer ${inMemoryToken}`;
+  }
+  const res = await fetch(url, {
+    method: 'GET',
+    headers,
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    let message = `Could not load file (${res.status})`;
+    try {
+      const json = await res.json();
+      message = json?.error || json?.message || message;
+    } catch {
+      // keep default status message
+    }
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  const contentType = res.headers.get('content-type') || blob.type || 'application/octet-stream';
+  return {
+    objectUrl: URL.createObjectURL(blob),
+    contentType,
+  };
+}
+
 const notificationListeners = new Set<(payload: any) => void>();
 
 export const notifications = {

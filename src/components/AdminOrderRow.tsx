@@ -251,7 +251,7 @@ export function AdminOrderRow({
                     Verify Paystack
                   </button>
                 )}
-                {order.paymentMethod === 'Bank transfer' && (
+                {(order.paymentMethod === 'Bank transfer' || order.paymentMethod === 'Crypto') && (
                   <button
                     type="button"
                     className="primary-btn compact-btn"
@@ -265,7 +265,11 @@ export function AdminOrderRow({
                       onConfirmPayment(order.id);
                     }}
                   >
-                    {confirmTransferArmed ? 'Tap again to confirm' : 'Confirm transfer'}
+                    {confirmTransferArmed
+                      ? 'Tap again to confirm'
+                      : order.paymentMethod === 'Crypto'
+                        ? 'Confirm crypto'
+                        : 'Confirm transfer'}
                   </button>
                 )}
               </div>
@@ -599,15 +603,30 @@ export function AdminOrderRow({
             <div className="order-info-grid">
               <div>
                 <small>Payment method</small>
-                <b>{order.paymentMethod || 'Not recorded'}</b>
+                <b>
+                  {order.paymentMethod === 'Crypto' && order.cryptoSymbol
+                    ? `Crypto · ${order.cryptoSymbol} (${order.cryptoNetwork || 'Network'})`
+                    : order.paymentMethod || 'Not recorded'}
+                </b>
               </div>
               <div>
                 <small>Transaction reference</small>
-                <b>{order.paystackReference || order.paymentReference || order.orderNumber}</b>
+                <b>{order.cryptoTxHash || order.paystackReference || order.paymentReference || order.orderNumber}</b>
               </div>
+              {order.paymentMethod === 'Crypto' && order.cryptoAddress && (
+                <div>
+                  <small>Receiving crypto wallet</small>
+                  <b className="crypto-address-mono">{order.cryptoAddress}</b>
+                </div>
+              )}
               <div>
                 <small>Payment amount</small>
-                <b className="tabular-nums">{money(order.total)}</b>
+                <b className="tabular-nums">
+                  {money(order.total)}
+                  {order.paymentMethod === 'Crypto' && order.cryptoTotalUsdt
+                    ? ` (${Number(order.cryptoTotalUsdt).toFixed(2)} USDT incl. ${Number(order.cryptoTransferFeeUsdt ?? 1).toFixed(2)} USDT fee)`
+                    : ''}
+                </b>
               </div>
               <div>
                 <small>Payment confirmation</small>
@@ -635,7 +654,7 @@ export function AdminOrderRow({
                     </button>
                   </>
                 )}
-                {order.paymentMethod === 'Bank transfer' && (
+                {(order.paymentMethod === 'Bank transfer' || order.paymentMethod === 'Crypto') && (
                   <button
                     type="button"
                     className="primary-btn"
@@ -650,11 +669,15 @@ export function AdminOrderRow({
                     }}
                   >
                     {confirmTransferArmed
-                      ? 'Tap again to confirm bank transfer received'
-                      : 'Confirm received money & mark payment successful'}
+                      ? order.paymentMethod === 'Crypto'
+                        ? 'Tap again to confirm crypto receipt'
+                        : 'Tap again to confirm bank transfer received'
+                      : order.paymentMethod === 'Crypto'
+                        ? 'Confirm crypto received & mark payment successful'
+                        : 'Confirm received money & mark payment successful'}
                   </button>
                 )}
-                {!['Paystack', 'Bank transfer', 'Wallet'].includes(order.paymentMethod) && (
+                {!['Paystack', 'Bank transfer', 'Crypto', 'Wallet'].includes(order.paymentMethod) && (
                   <button
                     type="button"
                     className="primary-btn"

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeOrderFinancials,
+  computeOrderLineSubtotal,
   formatOrderDetailsSummaryText,
   groupOrderItemsByVendor,
   type AdminOrderDetailRecord,
@@ -92,4 +93,11 @@ test('formatOrderDetailsSummaryText outputs complete customer, item, vendor, and
   assert.match(text, /Coupon \(SAVE10\): -NGN 4,200/);
   assert.match(text, /Tracking: DHL Express · DHL-88291/);
   assert.match(text, /Admin Note: Fragile electronic accessory/);
+});
+
+test('computeOrderLineSubtotal multiplies unit price by quantity and guards invalid or negative inputs', () => {
+  assert.equal(computeOrderLineSubtotal({ price: 5000, quantity: 2 }), 10000);
+  assert.equal(computeOrderLineSubtotal({ price: 1250.5, quantity: 3 }), 3751.5);
+  assert.equal(computeOrderLineSubtotal({ price: -100, quantity: 2 }), 0);
+  assert.equal(computeOrderLineSubtotal({ price: 1000, quantity: Number.NaN }), 0);
 });

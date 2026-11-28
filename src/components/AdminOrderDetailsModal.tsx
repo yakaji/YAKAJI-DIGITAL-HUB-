@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import {
   computeOrderFinancials,
+  computeOrderLineSubtotal,
   formatOrderDetailsSummaryText,
   groupOrderItemsByVendor,
   type AdminOrderDetailRecord,
@@ -269,56 +270,99 @@ export function AdminOrderDetailsModal({
             </div>
 
             <div className="admin-detail-vendor-groups">
-              {vendorGroups.map((group) => (
-                <div className="admin-detail-vendor-group" key={group.vendorKey}>
-                  <div className="admin-detail-vendor-head">
-                    <span className="admin-detail-vendor-title">
-                      <Store size={14} aria-hidden="true" />
-                      <b>{group.vendorName}</b>
-                    </span>
-                    <span className="admin-detail-meta-text tabular-nums">
-                      {group.itemCount} item{group.itemCount === 1 ? '' : 's'} ·{' '}
-                      {money(group.subtotal)}
-                    </span>
-                  </div>
-                  <div className="admin-detail-items-list">
-                    {group.items.map((item, idx) => {
-                      const thumbKey = `${order.id}:${item.productId}:${idx}`;
-                      const showImg = Boolean(item.productImage) && !failedThumbIds[thumbKey];
-                      return (
-                        <div className="admin-detail-item-row" key={thumbKey}>
-                          <div className="admin-detail-item-thumb">
-                            {showImg ? (
-                              <img
-                                src={item.productImage}
-                                alt={item.name}
-                                referrerPolicy="no-referrer"
-                                onError={() =>
-                                  setFailedThumbIds((prev) => ({ ...prev, [thumbKey]: true }))
-                                }
-                              />
-                            ) : (
-                              <Package size={18} aria-hidden="true" />
-                            )}
-                          </div>
-                          <div className="admin-detail-item-main">
-                            <b>{item.name}</b>
-                            <small>
-                              Qty {item.quantity} × {money(item.price)}
-                              {item.option ? ` · Option: ${item.option}` : ''}
-                              {item.productCategory ? ` · ${item.productCategory}` : ''}
-                              {item.productId ? ` · Product ID: ${item.productId}` : ''}
-                            </small>
-                          </div>
-                          <b className="admin-detail-item-total tabular-nums">
-                            {money(Number(item.price || 0) * Number(item.quantity || 0))}
-                          </b>
-                        </div>
-                      );
-                    })}
-                  </div>
+              {vendorGroups.length === 0 ? (
+                <div className="admin-detail-vendor-group">
+                  <p className="admin-detail-empty-items">No line items recorded for this order.</p>
                 </div>
-              ))}
+              ) : (
+                vendorGroups.map((group) => (
+                  <div className="admin-detail-vendor-group" key={group.vendorKey}>
+                    <div className="admin-detail-vendor-head">
+                      <span className="admin-detail-vendor-title">
+                        <Store size={14} aria-hidden="true" />
+                        <b>{group.vendorName}</b>
+                      </span>
+                      <span className="admin-detail-meta-text tabular-nums">
+                        {group.itemCount} item{group.itemCount === 1 ? '' : 's'} ·{' '}
+                        {money(group.subtotal)}
+                      </span>
+                    </div>
+                    <div className="admin-detail-table-wrap">
+                      <table
+                        className="admin-detail-items-table"
+                        aria-label={`Order items from ${group.vendorName}`}
+                      >
+                        <thead>
+                          <tr>
+                            <th scope="col">Product</th>
+                            <th scope="col" className="num col-unit-price">
+                              Unit price
+                            </th>
+                            <th scope="col" className="num col-qty">
+                              Qty
+                            </th>
+                            <th scope="col" className="num col-subtotal">
+                              Subtotal
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {group.items.map((item, idx) => {
+                            const thumbKey = `${order.id}:${item.productId}:${idx}`;
+                            const showImg = Boolean(item.productImage) && !failedThumbIds[thumbKey];
+                            const lineSubtotal = computeOrderLineSubtotal(item);
+                            const metaParts = [
+                              item.option ? `Option: ${item.option}` : '',
+                              item.productCategory || '',
+                              item.productId ? `ID: ${item.productId}` : '',
+                            ].filter(Boolean);
+                            return (
+                              <tr key={thumbKey}>
+                                <td>
+                                  <div className="admin-detail-item-product">
+                                    <div className="admin-detail-item-thumb">
+                                      {showImg ? (
+                                        <img
+                                          src={item.productImage}
+                                          alt={item.name}
+                                          referrerPolicy="no-referrer"
+                                          onError={() =>
+                                            setFailedThumbIds((prev) => ({
+                                              ...prev,
+                                              [thumbKey]: true,
+                                            }))
+                                          }
+                                        />
+                                      ) : (
+                                        <Package size={18} aria-hidden="true" />
+                                      )}
+                                    </div>
+                                    <div className="admin-detail-item-main">
+                                      <b>{item.name}</b>
+                                      {metaParts.length > 0 && (
+                                        <small>{metaParts.join(' · ')}</small>
+                                      )}
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="num col-unit-price admin-detail-item-unit tabular-nums">
+                                  {money(Number(item.price || 0))}
+                                </td>
+                                <td className="num col-qty admin-detail-item-qty tabular-nums">
+                                  {item.quantity}
+                                </td>
+                                <td className="num col-subtotal admin-detail-item-subtotal tabular-nums">
+                                  {money(lineSubtotal)}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
 
             <div className="admin-detail-ledger tabular-nums">
@@ -337,7 +381,11 @@ export function AdminOrderDetailsModal({
               )}
               {financials.transferFee > 0 && (
                 <div className="admin-detail-ledger-row">
-                  <span>Bank transfer fee</span>
+                  <span>
+                    {order.paymentMethod === 'Crypto'
+                      ? `Crypto transfer fee (${Number(order.cryptoTransferFeeUsdt ?? 1).toFixed(2)} USDT)`
+                      : 'Bank transfer fee'}
+                  </span>
                   <b>{money(financials.transferFee)}</b>
                 </div>
               )}
@@ -354,7 +402,12 @@ export function AdminOrderDetailsModal({
               )}
               <div className="admin-detail-ledger-row is-total">
                 <span>Total charged</span>
-                <strong>{money(financials.total)}</strong>
+                <strong>
+                  {money(financials.total)}
+                  {order.paymentMethod === 'Crypto' && order.cryptoTotalUsdt
+                    ? ` · ${Number(order.cryptoTotalUsdt).toFixed(2)} USDT`
+                    : ''}
+                </strong>
               </div>
             </div>
           </section>
@@ -373,12 +426,30 @@ export function AdminOrderDetailsModal({
             <div className="order-info-grid">
               <div>
                 <small>Payment method</small>
-                <b>{order.paymentMethod || 'Not recorded'}</b>
+                <b>
+                  {order.paymentMethod === 'Crypto' && order.cryptoSymbol
+                    ? `Crypto · ${order.cryptoCoin || order.cryptoSymbol} (${order.cryptoNetwork || 'Network'})`
+                    : order.paymentMethod || 'Not recorded'}
+                </b>
               </div>
+              {order.paymentMethod === 'Crypto' && order.cryptoTotalUsdt && (
+                <div>
+                  <small>Expected USDT amount (incl. fee)</small>
+                  <b className="tabular-nums">
+                    {Number(order.cryptoTotalUsdt).toFixed(2)} USDT (Items {Number(order.cryptoItemsUsdt || 0).toFixed(2)} + Fee {Number(order.cryptoTransferFeeUsdt ?? 1).toFixed(2)} USDT @ {money(Number(order.cryptoUsdtRate || 1600))}/USDT)
+                  </b>
+                </div>
+              )}
               <div>
-                <small>Transaction / Paystack reference</small>
-                <b>{order.paystackReference || order.paymentReference || order.orderNumber}</b>
+                <small>Transaction / Paystack / TX hash</small>
+                <b>{order.cryptoTxHash || order.paystackReference || order.paymentReference || order.orderNumber}</b>
               </div>
+              {order.paymentMethod === 'Crypto' && order.cryptoAddress && (
+                <div>
+                  <small>Receiving wallet address</small>
+                  <b className="crypto-address-mono">{order.cryptoAddress}</b>
+                </div>
+              )}
               <div>
                 <small>Payment confirmed at</small>
                 <b>
@@ -445,7 +516,7 @@ export function AdminOrderDetailsModal({
                     </button>
                   </>
                 )}
-                {order.paymentMethod === 'Bank transfer' && (
+                {(order.paymentMethod === 'Bank transfer' || order.paymentMethod === 'Crypto') && (
                   <button
                     type="button"
                     className="primary-btn compact-btn"
@@ -460,11 +531,13 @@ export function AdminOrderDetailsModal({
                     }}
                   >
                     {confirmTransferArmed
-                      ? 'Tap again to confirm transfer'
-                      : 'Confirm bank transfer received'}
+                      ? 'Tap again to confirm'
+                      : order.paymentMethod === 'Crypto'
+                        ? 'Confirm crypto receipt'
+                        : 'Confirm bank transfer received'}
                   </button>
                 )}
-                {!['Paystack', 'Bank transfer', 'Wallet'].includes(order.paymentMethod) && (
+                {!['Paystack', 'Bank transfer', 'Crypto', 'Wallet'].includes(order.paymentMethod) && (
                   <button
                     type="button"
                     className="primary-btn compact-btn"
